@@ -2346,18 +2346,6 @@ class MainApp:
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
             text_color = "black"
-            try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(
-                    0.02,
-                    0.95,
-                    f"RMS acc: {rms_acc:.3e} m/s²",
-                    transform=ax1.transAxes,
-                    va="top",
-                    color=text_color,
-                )
-            except Exception:
-                pass
 
             # Ajustar etiqueta de eje Y segun unidad seleccionada
             try:
@@ -2366,20 +2354,20 @@ class MainApp:
                 pass
 
             # Anotar RMS conforme a la unidad seleccionada
-            try:
-                ax1.text(
-                    0.02,
-                    0.95,
-                    _rms_text,
-                    transform=ax1.transAxes,
-                    va="top",
-                    color=text_color,
-                )
-            except Exception:
-                pass
-
             if axis_rms:
                 self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
+            else:
+                try:
+                    ax1.text(
+                        0.02,
+                        0.95,
+                        _rms_text,
+                        transform=ax1.transAxes,
+                        va="top",
+                        color=text_color,
+                    )
+                except Exception:
+                    pass
             img_time = save_plot(fig1)
 
             try:
@@ -2849,21 +2837,26 @@ class MainApp:
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
 
-            if axis_rms and axis_columns:
-                axis_table_data = [["Eje", "RMS (mm/s)"]]
+            if axis_rms:
+                axis_table_data = [["Eje", "RMS (mm/s)", "Severidad ISO"]]
                 for axis_label in ("X", "Y", "Z"):
-                    if axis_label in axis_columns and axis_label in axis_rms:
-                        col_name = axis_columns.get(axis_label, axis_label)
+                    if axis_label in axis_rms:
+                        col_name = axis_columns.get(axis_label, axis_label) if axis_columns else axis_label
+                        info = self._iso_severity_light(axis_rms.get(axis_label, 0.0))
                         axis_table_data.append([
-                            f"{axis_label} ({col_name})",
+                            f"{axis_label} ({col_name})" if axis_columns else axis_label,
                             f"{axis_rms[axis_label]:.2f}",
+                            f"{info['emoji']} {info['label']}",
                         ])
-                if len(axis_table_data) > 1:
+                if "Global" in axis_rms:
+                    info_global = self._iso_severity_light(axis_rms.get("Global", 0.0))
                     axis_table_data.append([
                         "Global (vectorial)",
                         f"{axis_rms.get('Global', 0.0):.2f}",
+                        f"{info_global['emoji']} {info_global['label']}",
                     ])
-                    axis_table = Table(axis_table_data, colWidths=[200, 200])
+                if len(axis_table_data) > 1:
+                    axis_table = Table(axis_table_data, colWidths=[180, 100, 220])
                     _apply_table_style(axis_table)
                     elements.append(axis_table)
                     elements.append(Spacer(1, 12))
@@ -4951,18 +4944,92 @@ class MainApp:
         axis_values["Global"] = global_val
         return axis_values
 
+    def _iso_severity_light(self, rms_mm: float) -> Dict[str, str]:
+        """Devuelve la etiqueta/emoji/color de severidad ISO 10816 para un RMS (mm/s)."""
+
+        try:
+            value = float(rms_mm)
+        except Exception:
+            value = float("nan")
+
+        if not np.isfinite(value) or value < 0:
+            return {"label": "Sin datos", "color": "#7f8c8d", "emoji": "⚪"}
+
+        thresholds = (
+            (2.8, "Zona A - Buena", "#2ecc71", "🟢"),
+            (4.5, "Zona B - Satisfactoria", "#f1c40f", "🟡"),
+            (7.1, "Zona C - Insatisfactoria", "#e67e22", "🟠"),
+        )
+
+        for limit, label, color, emoji in thresholds:
+            if value <= limit:
+                return {"label": label, "color": color, "emoji": emoji}
+
+        return {"label": "Zona D - Inaceptable", "color": "#e74c3c", "emoji": "🔴"}
+
+    def _build_rms_semaphore_controls(self, axis_rms: Optional[Dict[str, float]]) -> List[ft.Control]:
+        """Genera tarjetas con semáforo ISO para cada eje disponible y el global."""
+
+        if not axis_rms:
+            return []
+
+        cards: List[ft.Control] = []
+        order = ("X", "Y", "Z", "Global")
+        for axis_label in order:
+            if axis_label not in axis_rms:
+                continue
+            info = self._iso_severity_light(axis_rms.get(axis_label, 0.0))
+            value = axis_rms.get(axis_label, 0.0)
+            indicator = ft.Row(
+                [
+                    ft.Container(width=12, height=12, bgcolor=info["color"], border_radius=6),
+                    ft.Text(f"{axis_label}", weight="bold"),
+                ],
+                spacing=8,
+                alignment=ft.MainAxisAlignment.START,
+            )
+            card = ft.Container(
+                content=ft.Column(
+                    [
+                        indicator,
+                        ft.Text(f"{value:.2f} mm/s", size=14, weight="bold"),
+                        ft.Text(f"{info['emoji']} {info['label']}", size=12, color=info["color"]),
+                    ],
+                    spacing=4,
+                    horizontal_alignment=ft.CrossAxisAlignment.START,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.12, info["color"]),
+                border_radius=10,
+                padding=10,
+                width=170,
+            )
+            cards.append(card)
+
+        if not cards:
+            return []
+
+        header = ft.Text("Semáforo RMS ISO 10816 (10–1000 Hz)", weight="bold")
+        row = ft.Row(controls=cards, wrap=True, spacing=12, run_spacing=12)
+        return [header, row]
+
     def _plot_rms_summary(self, ax, rms_dict: Optional[Dict[str, float]], text_color: str = "white"):
         """Inserta en la gráfica un resumen de RMS por eje y global."""
 
         if ax is None or not rms_dict:
             return
         try:
-            txt = (
-                f"RMS X: {rms_dict.get('X', 0.0):.2f} mm/s | "
-                f"RMS Y: {rms_dict.get('Y', 0.0):.2f} mm/s | "
-                f"RMS Z: {rms_dict.get('Z', 0.0):.2f} mm/s | "
-                f"Global: {rms_dict.get('Global', 0.0):.2f} mm/s"
-            )
+            lines: List[str] = []
+            for axis_label in ("X", "Y", "Z", "Global"):
+                if axis_label not in rms_dict:
+                    continue
+                value = float(rms_dict.get(axis_label, 0.0))
+                info = self._iso_severity_light(value)
+                lines.append(
+                    f"{info['emoji']} {axis_label}: {value:.2f} mm/s ({info['label']})"
+                )
+            if not lines:
+                return
+            txt = "\n".join(lines)
             ax.text(
                 0.02,
                 0.93,
@@ -4971,6 +5038,11 @@ class MainApp:
                 va="top",
                 color=text_color,
                 fontsize=10,
+                bbox={
+                    "boxstyle": "round,pad=0.3",
+                    "facecolor": (0.0, 0.0, 0.0, 0.35) if text_color == "white" else (1.0, 1.0, 1.0, 0.6),
+                    "edgecolor": "none",
+                },
             )
         except Exception:
             pass
@@ -6337,22 +6409,20 @@ class MainApp:
 
             text_color = "white" if self.is_dark_mode else "black"
 
-            # Anotar RMS de Aceleracion (tiempo)
-            try:
-                rms_acc = self._calculate_rms(signal_segment)
-                ax1.text(
-                    0.02,
-                    0.95,
-                    _rms_text,
-                    transform=ax1.transAxes,
-                    va="top",
-                    color=text_color,
-                )
-            except Exception:
-                pass
-
             if axis_rms:
                 self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
+            else:
+                try:
+                    ax1.text(
+                        0.02,
+                        0.95,
+                        _rms_text,
+                        transform=ax1.transAxes,
+                        va="top",
+                        color=text_color,
+                    )
+                except Exception:
+                    pass
 
 
             # Aplicar filtros visuales de frecuencia (LF y/o límite HF)
@@ -6728,18 +6798,23 @@ class MainApp:
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
+            resumen_exec_controls: List[ft.Control] = [
+                ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
+                ft.Row([
+                    ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
+                    ft.Text(f"Clasificación ISO: {sev_label}")
+                ]),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+            ]
+            if axis_rms:
+                resumen_exec_controls.extend(self._build_rms_semaphore_controls(axis_rms))
+            else:
+                resumen_exec_controls.append(ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"))
+            resumen_exec_controls.append(ft.Text("Diagnóstico:"))
+            resumen_exec_controls.extend(ft.Text(f"- {it}") for it in exec_findings)
+
             resumen_exec = ft.Container(
-                content=ft.Column([
-                    ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
-                    ft.Row([
-                        ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
-                        ft.Text(f"Clasificación ISO: {sev_label}")
-                    ]),
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                    ft.Text("Diagnóstico:"),
-                    *[ft.Text(f"- {it}") for it in exec_findings],
-                ], spacing=6),
+                content=ft.Column(resumen_exec_controls, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
                 border_radius=10,
                 padding=10
@@ -6747,30 +6822,26 @@ class MainApp:
 
             # --- Panel resumen + diagnóstico ---
 
+            resumen_controls: List[ft.Control] = [
+                ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
+                ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text(
+                    "Crest factor (aceleración): "
+                    f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                ),
+            ]
+            if axis_rms:
+                resumen_controls.extend(self._build_rms_semaphore_controls(axis_rms))
+            else:
+                resumen_controls.append(ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"))
+            resumen_controls.append(ft.Divider())
+            resumen_controls.append(ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"))
+            resumen_controls.extend(ft.Text(f"• {it}") for it in findings)
+
             resumen = ft.Container(
 
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
+                content=ft.Column(resumen_controls, spacing=6),
 
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
 
