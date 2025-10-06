@@ -1041,6 +1041,21 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        try:
+            stored_input_unit = self.page.client_storage.get("input_signal_unit")
+        except Exception:
+            stored_input_unit = None
+        valid_input_units = {
+            "acc_ms2",
+            "acc_g",
+            "vel_ms",
+            "vel_mm",
+            "vel_ips",
+            "disp_m",
+            "disp_mm",
+            "disp_um",
+        }
+        self.input_signal_unit = stored_input_unit if stored_input_unit in valid_input_units else "acc_ms2"
 
 
 
@@ -2171,7 +2186,8 @@ class MainApp:
             except Exception:
                 start_t, end_t = t[0], t[-1]
             mask = (t >= start_t) & (t <= end_t)
-            t_seg, sig_seg = t[mask], signal[mask]
+            t_seg_raw, sig_seg_raw = t[mask], signal[mask]
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw)
 
             def compute_fft_dual(y, tv):
                 N = len(y)
@@ -2187,13 +2203,13 @@ class MainApp:
                 mag_vel_mm = mag_vel * 1000.0
                 return xf, mag_vel_mm, mag_vel
 
-            xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
+            xf, mag_vel_mm, mag_vel = compute_fft_dual(acc_seg, t_seg)
             rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
             rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
             severity_mm = self._classify_severity(rms_mm)
 
             if xf is not None:
-                features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm)
+                features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm)
             else:
                 features_full = {"dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                                  "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0}
@@ -2201,7 +2217,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = self._diagnose(features_full) if xf is not None else ["Sin espectro válido para diagnóstico."]
 
             # Unificar cálculo con analizador (RMS de velocidad correcto)
@@ -2227,7 +2243,7 @@ class MainApp:
                 _fmax_pre = None
             res = analyze_vibration(
                 t_seg,
-                sig_seg,
+                acc_seg,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
                 bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
@@ -2243,7 +2259,7 @@ class MainApp:
             mag_vel_mm = res['fft']['vel_spec_mm_s']
             rms_mm = res['severity']['rms_mm_s']
             severity_mm = res['severity']['label']
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm) if xf is not None else {
+            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
                 "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                 "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
             }
@@ -2254,7 +2270,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', []) if xf is not None else ["Sin espectro valido para diagnostico."]
 
             # Recalcular con analizador unificado (RMS de velocidad correcto)
@@ -2279,7 +2295,7 @@ class MainApp:
                 _fmax_pre = None
             res = analyze_vibration(
                 t_seg,
-                sig_seg,
+                acc_seg,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
                 bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
@@ -2295,7 +2311,7 @@ class MainApp:
             mag_vel_mm = res['fft']['vel_spec_mm_s']
             rms_mm = res['severity']['rms_mm_s']
             severity_mm = res['severity']['label']
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm) if xf is not None else {
+            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
                 "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                 "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
             }
@@ -2306,7 +2322,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', [])
             severity_entry_pdf = res.get('diagnosis_summary')
             findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
@@ -2315,6 +2331,23 @@ class MainApp:
             charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
             if not charlotte_catalog_pdf:
                 charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
+
+            try:
+                unit_mode = getattr(self.time_unit_dd, 'value', 'vel_mm')
+            except Exception:
+                unit_mode = 'vel_mm'
+            if unit_mode == 'vel_mm':
+                _y_time = self._acc_to_vel_time_mm(acc_seg, t_seg)
+                _ylabel = 'Velocidad [mm/s]'
+                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else 'RMS vel: 0.000 mm/s'
+            elif unit_mode == 'acc_g':
+                _y_time = acc_seg / 9.80665
+                _ylabel = 'Aceleración [g]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
+            else:
+                _y_time = acc_seg
+                _ylabel = 'Aceleración [m/s²]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
 
             tmp_imgs = []
             def save_plot(fig):
@@ -2325,22 +2358,11 @@ class MainApp:
                 return path
 
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            if len(t_seg) > 0 and len(_y_time) > 0:
+                ax1.plot(t_seg, _y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
-            except Exception:
-                pass
-
-            # Ajustar etiqueta de eje Y segun unidad seleccionada
-            try:
-                ax1.set_ylabel(_ylabel)
-            except Exception:
-                pass
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS conforme a la unidad seleccionada
             try:
@@ -2556,7 +2578,7 @@ class MainApp:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
                     runup_fig = self._generate_runup_3d_figure(
                         t_seg,
-                        sig_seg,
+                        acc_seg,
                         fc,
                         hide_lf,
                         fmax_ui,
@@ -3761,7 +3783,8 @@ class MainApp:
 
             mask = (t >= start_t) & (t <= end_t)
 
-            t_seg, sig_seg = t[mask], signal[mask]
+            t_seg_raw, sig_seg_raw = t[mask], signal[mask]
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw)
 
 
 
@@ -3782,19 +3805,19 @@ class MainApp:
                 mag_vel_mm = mag_vel * 1000.0
                 return xf, mag_vel_mm, mag_vel
 
-            xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
+            xf, mag_vel_mm, mag_vel = compute_fft_dual(acc_seg, t_seg)
             rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
             rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
             severity_mm = self._classify_severity(rms_mm)
             severity_label_ms, severity_color_ms = self._classify_severity_ms(rms_ms)
 
             # --- Features + diagnóstico para el PDF (usa mm/s) ---
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm)
+            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm)
             # Guardar última FFT/segmento para diagnóstico avanzado (PDF)
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', [])
             severity_entry_pdf = res.get('diagnosis_summary')
             findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
@@ -3825,17 +3848,33 @@ class MainApp:
 
 
 
+            try:
+                unit_mode = getattr(self.time_unit_dd, 'value', 'vel_mm')
+            except Exception:
+                unit_mode = 'vel_mm'
+            if unit_mode == 'vel_mm':
+                _y_time = self._acc_to_vel_time_mm(acc_seg, t_seg)
+                _ylabel = 'Velocidad [mm/s]'
+                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else 'RMS vel: 0.000 mm/s'
+            elif unit_mode == 'acc_g':
+                _y_time = acc_seg / 9.80665
+                _ylabel = 'Aceleración [g]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
+            else:
+                _y_time = acc_seg
+                _ylabel = 'Aceleración [m/s²]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
+
             # Señal principal
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            if len(t_seg) > 0 and len(_y_time) > 0:
+                ax1.plot(t_seg, _y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            # Anotar RMS aceleración
+            ax1.set_ylabel(_ylabel)
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
+                text_color = 'white' if self.is_dark_mode else 'black'
+                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va='top', color=text_color)
             except Exception:
                 pass
             img_time = save_plot(fig1)
@@ -4243,11 +4282,27 @@ class MainApp:
 
         # Parámetros de máquina (opcionales) para diagnóstico avanzado
         # Selección de unidad para la señal en tiempo (aceleración vs velocidad)
+        self.input_signal_unit_dd = ft.Dropdown(
+            label="Unidad original",
+            options=[
+                ft.dropdown.Option("acc_ms2", "Aceleración (m/s²)"),
+                ft.dropdown.Option("acc_g", "Aceleración (g)"),
+                ft.dropdown.Option("vel_ms", "Velocidad (m/s)"),
+                ft.dropdown.Option("vel_mm", "Velocidad (mm/s)"),
+                ft.dropdown.Option("vel_ips", "Velocidad (in/s)"),
+                ft.dropdown.Option("disp_m", "Desplazamiento (m)"),
+                ft.dropdown.Option("disp_mm", "Desplazamiento (mm)"),
+                ft.dropdown.Option("disp_um", "Desplazamiento (µm)"),
+            ],
+            value=self.input_signal_unit if getattr(self, "input_signal_unit", None) else "acc_ms2",
+            width=220,
+            on_change=self._on_input_signal_unit_change,
+        )
         self.time_unit_dd = ft.Dropdown(
             label="Señal de tiempo",
             options=[
                 ft.dropdown.Option("acc", "Aceleración (m/s^2)"),
-                ft.dropdown.Option("acc_g", "Aceleraci3n (g)"),
+                ft.dropdown.Option("acc_g", "Aceleración (g)"),
                 ft.dropdown.Option("vel_mm", "Velocidad (mm/s)"),
             ],
             value="vel_mm",
@@ -4540,7 +4595,7 @@ class MainApp:
                 ft.Text("Columnas base", size=14, weight="bold"),
                 ft.Row([self.time_dropdown, self.fft_dropdown], spacing=10),
                 ft.Text("Unidades y colores", size=14, weight="bold"),
-                ft.Row([self.time_unit_dd], spacing=10),
+                ft.Row([self.input_signal_unit_dd, self.time_unit_dd], spacing=10, wrap=True),
                 ft.Row([self.time_color_dd, self.fft_color_dd], spacing=10),
             ],
             spacing=12,
@@ -5465,6 +5520,97 @@ class MainApp:
 
         return lines
 
+    def _normalize_time_series(self, t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Normaliza la serie temporal: limpia NaN, ordena, arranca en 0 y fuerza muestreo uniforme."""
+        t_arr = np.asarray(t, dtype=float).ravel()
+        y_arr = np.asarray(y, dtype=float).ravel()
+        mask = np.isfinite(t_arr) & np.isfinite(y_arr)
+        t_arr = t_arr[mask]
+        y_arr = y_arr[mask]
+        if t_arr.size == 0:
+            return t_arr, y_arr, 0.0
+        order = np.argsort(t_arr)
+        t_arr = t_arr[order]
+        y_arr = y_arr[order]
+        unique_t, unique_idx = np.unique(t_arr, return_index=True)
+        if unique_t.size != t_arr.size:
+            t_arr = unique_t
+            y_arr = y_arr[unique_idx]
+        t_arr = t_arr - float(t_arr[0])
+        if t_arr.size < 2:
+            return t_arr.astype(float), y_arr.astype(float), 0.0
+        diffs = np.diff(t_arr)
+        valid_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if valid_diffs.size == 0:
+            target_dt = 0.0
+        else:
+            target_dt = float(np.median(valid_diffs))
+        if not np.isfinite(target_dt) or target_dt <= 0:
+            target_dt = float(np.mean(valid_diffs)) if valid_diffs.size else 0.0
+        if not np.isfinite(target_dt) or target_dt <= 0:
+            target_dt = 1.0
+        uniform_t = np.linspace(0.0, target_dt * (t_arr.size - 1), t_arr.size)
+        need_interp = False
+        if valid_diffs.size:
+            tol = max(1e-9, 1e-3 * target_dt)
+            need_interp = np.max(np.abs(diffs - target_dt)) > tol
+        if need_interp:
+            y_uniform = np.interp(uniform_t, t_arr, y_arr)
+        else:
+            y_uniform = y_arr
+        return uniform_t.astype(float), np.asarray(y_uniform, dtype=float), float(target_dt)
+
+    def _convert_signal_to_acceleration(self, y: np.ndarray, dt: float) -> np.ndarray:
+        """Convierte una señal (velocidad/desplazamiento/aceleración) a aceleración [m/s²]."""
+        unit = getattr(self, "input_signal_unit", "acc_ms2") or "acc_ms2"
+        y = np.asarray(y, dtype=float).ravel()
+        if y.size == 0:
+            return y
+        g = 9.80665
+        if unit == "acc_ms2":
+            acc = y
+        elif unit == "acc_g":
+            acc = y * g
+        elif unit == "vel_ms":
+            acc = np.gradient(y, dt, edge_order=2 if y.size > 2 else 1) if dt > 0 else np.zeros_like(y)
+        elif unit == "vel_mm":
+            vel = y / 1000.0
+            acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1) if dt > 0 else np.zeros_like(vel)
+        elif unit == "vel_ips":
+            vel = y * 0.0254
+            acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1) if dt > 0 else np.zeros_like(vel)
+        elif unit == "disp_m":
+            if dt > 0:
+                vel = np.gradient(y, dt, edge_order=2 if y.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(y)
+        elif unit == "disp_mm":
+            disp = y / 1000.0
+            if dt > 0:
+                vel = np.gradient(disp, dt, edge_order=2 if disp.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(disp)
+        elif unit == "disp_um":
+            disp = y * 1e-6
+            if dt > 0:
+                vel = np.gradient(disp, dt, edge_order=2 if disp.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(disp)
+        else:
+            acc = y
+        return np.asarray(acc, dtype=float)
+
+    def _prepare_segment_for_analysis(
+        self, t: np.ndarray, y: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Prepara la señal recortada para el análisis y devuelve tiempo uniforme y aceleración."""
+        t_uniform, y_uniform, dt = self._normalize_time_series(t, y)
+        acc = self._convert_signal_to_acceleration(y_uniform, dt)
+        return t_uniform, acc, dt, y_uniform
+
     def _acc_to_vel_time_mm(self, acc: np.ndarray, t: np.ndarray) -> np.ndarray:
         """
         Integra aceleración en el dominio de la frecuencia para obtener velocidad en el tiempo (mm/s).
@@ -5875,9 +6021,11 @@ class MainApp:
 
             mask = (t >= start_t) & (t <= end_t)
 
-            t_segment, signal_segment = t[mask], signal[mask]
+            t_segment_raw, signal_segment_raw = t[mask], signal[mask]
 
-            if len(signal_segment) < 2:
+            t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw)
+
+            if len(acc_segment) < 2:
 
                 return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
@@ -5909,7 +6057,7 @@ class MainApp:
                 _fmax_pre = None
             res = analyze_vibration(
                 t_segment,
-                signal_segment,
+                acc_segment,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
                 bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
@@ -6017,7 +6165,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_segment
-            self._last_accseg = signal_segment
+            self._last_accseg = acc_segment
 
 
 
@@ -6034,15 +6182,15 @@ class MainApp:
             except Exception:
                 unit_mode = "vel_mm"
             if unit_mode == "vel_mm":
-                _y_time = self._acc_to_vel_time_mm(signal_segment, t_segment)
+                _y_time = self._acc_to_vel_time_mm(acc_segment, t_segment)
                 _ylabel = "Velocidad [mm/s]"
                 _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else "RMS vel: 0.000 mm/s"
             elif unit_mode == "acc_g":
-                _y_time = signal_segment / 9.80665
+                _y_time = acc_segment / 9.80665
                 _ylabel = "Aceleración [g]"
                 _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
             else:
-                _y_time = signal_segment
+                _y_time = acc_segment
                 _ylabel = "Aceleración [m/s²]"
                 _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
 
@@ -6054,12 +6202,12 @@ class MainApp:
 
             ax1.set_xlabel("Tiempo (s)")
 
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS de Aceleracion (tiempo)
             try:
                 text_color = "white" if self.is_dark_mode else "black"
-                rms_acc = self._calculate_rms(signal_segment)
+                rms_acc = self._calculate_rms(acc_segment)
                 ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes,
                          va="top", color=text_color)
             except Exception:
@@ -6381,7 +6529,7 @@ class MainApp:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
                     runup_fig = self._generate_runup_3d_figure(
                         t_segment,
-                        signal_segment,
+                        acc_segment,
                         fc,
                         hide_lf,
                         fmax_ui,
@@ -6472,7 +6620,7 @@ class MainApp:
 
                     ft.Text(
                         f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                        f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}"
                     ),
 
                     ft.Divider(),
@@ -7811,6 +7959,19 @@ class MainApp:
                 ctrl.update()
         self._update_analysis()
 
+    def _on_input_signal_unit_change(self, e=None):
+        unit = getattr(getattr(e, "control", None), "value", None) if e else None
+        self.input_signal_unit = unit if unit else getattr(self, "input_signal_unit", "acc_ms2")
+        try:
+            self.page.client_storage.set("input_signal_unit", self.input_signal_unit)
+        except Exception:
+            pass
+        self._update_analysis()
+        try:
+            self._update_multi_chart()
+        except Exception:
+            pass
+
     def _on_fft_color_change(self, e=None):
 
         selected = getattr(getattr(e, "control", None), "value", None) if e else None
@@ -7967,32 +8128,31 @@ class MainApp:
 
                 for sig in selected_signals:
 
-                    y = self.current_df[sig].to_numpy()
-
-                    N = len(y)
-
-                    if N < 2:
-
+                    y_raw = self.current_df[sig].to_numpy()
+                    t_sig, acc_sig, _, _ = self._prepare_segment_for_analysis(t, y_raw)
+                    if acc_sig.size < 2 or t_sig.size != acc_sig.size:
                         continue
+                    try:
+                        pre_dec = float(fmax_ui) if fmax_ui and fmax_ui > 0 else None
+                    except Exception:
+                        pre_dec = None
+                    res_sig = analyze_vibration(
+                        t_sig,
+                        acc_sig,
+                        pre_decimate_to_fmax_hz=pre_dec,
+                    )
+                    xf = res_sig.get('fft', {}).get('f_hz')
+                    mag_vel_mm = res_sig.get('fft', {}).get('vel_spec_mm_s')
+                    mag_acc = res_sig.get('fft', {}).get('acc_spec_ms2')
+                    if xf is None or mag_vel_mm is None:
+                        continue
+                    xf = np.asarray(xf, dtype=float)
+                    mag_vel_mm = np.asarray(mag_vel_mm, dtype=float)
+                    mag_acc = np.asarray(mag_acc if mag_acc is not None else np.zeros_like(mag_vel_mm), dtype=float)
 
-                    T = t[1] - t[0]
-
-                    yf = np.fft.fft(y)
-
-                    xf = np.fft.fftfreq(N, T)[:N // 2]
-
-                    mag_acc = 2.0 / N * np.abs(yf[0:N // 2])
-
-                    mag_vel_mm = np.zeros_like(mag_acc)
-
-                    mag_vel_mm[xf > 0] = (mag_acc[xf > 0] / (2 * np.pi * xf[xf > 0])) * 1000
-
-
-
-                    # Aplicar máscara de frecuencia
                     mask = xf >= max(0.0, fmin_ui)
                     if fmax_ui and fmax_ui > 0:
-                        mask = mask & (xf <= fmax_ui)
+                        mask = mask & (xf <= float(fmax_ui))
 
                     if use_dbv:
                         if sens_unit == 'mV/g':
@@ -8005,16 +8165,15 @@ class MainApp:
                         elif sens_unit == 'V/(mm/s)':
                             V_amp = mag_vel_mm * sens_val * gain_vv
                         else:
-                            V_amp = mag_vel_mm * 0.0
+                            V_amp = np.zeros_like(mag_vel_mm)
                         eps = 1e-12
                         yplot = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
                         ax.plot(xf[mask], yplot[mask], linewidth=2, label=sig)
                     else:
-                        if normalize and mag_vel_mm.max() > 0:
-                            mag_vel_mm = mag_vel_mm / mag_vel_mm.max()
-                        ax.plot(xf[mask], mag_vel_mm[mask], linewidth=2, label=sig)
-
-
+                        yplot = mag_vel_mm.copy()
+                        if normalize and yplot.max() > 0:
+                            yplot = yplot / yplot.max()
+                        ax.plot(xf[mask], yplot[mask], linewidth=2, label=sig)
 
                 ax.set_title("FFT combinada de señales")
 
