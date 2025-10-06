@@ -7,6 +7,7 @@ from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
 import matplotlib
+import re
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -16,7 +17,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Set
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
 from reportlab.lib.pagesizes import A4
@@ -1043,6 +1044,9 @@ class MainApp:
         self._last_combined_sources: List[str] = []
         self._last_axis_columns: Dict[str, str] = {}
         self._last_axis_rms: Dict[str, float] = {}
+        self._normalized_axis_columns: Dict[str, str] = {}
+        self.default_time_col: Optional[str] = None
+        self.default_signal_cols: List[str] = []
 
 
 
@@ -4249,7 +4253,13 @@ class MainApp:
 
         numeric_cols = self.current_df.select_dtypes(include=np.number).columns.tolist()
 
-        initial_time_col = "t_s" if "t_s" in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+        stored_default_time = getattr(self, "default_time_col", None)
+        if stored_default_time in numeric_cols:
+            initial_time_col = stored_default_time
+        elif "t_s" in numeric_cols:
+            initial_time_col = "t_s"
+        else:
+            initial_time_col = numeric_cols[0] if numeric_cols else None
 
 
 
@@ -4271,7 +4281,12 @@ class MainApp:
 
         # Dropdown FFT
 
-        available_signals = [col for col in numeric_cols if col != initial_time_col]
+        preferred_signals = [
+            col
+            for col in getattr(self, "default_signal_cols", [])
+            if col in numeric_cols and col != initial_time_col
+        ]
+        available_signals = preferred_signals or [col for col in numeric_cols if col != initial_time_col]
 
         self.fft_dropdown = ft.Dropdown(
 
@@ -4350,12 +4365,14 @@ class MainApp:
 
         # Señales de tiempo
 
+        default_checked = set(preferred_signals) if preferred_signals else None
         self.signal_checkboxes = [
-
-            ft.Checkbox(label=col, value=(col.startswith("a")))
-
-            for col in numeric_cols if col != initial_time_col
-
+            ft.Checkbox(
+                label=col,
+                value=(col in default_checked) if default_checked is not None else col.lower().startswith("a"),
+            )
+            for col in numeric_cols
+            if col != initial_time_col
         ]
 
         self.combine_signals_cb = ft.Checkbox(
@@ -5092,10 +5109,20 @@ class MainApp:
             time_col = None
 
         axis_cols: Dict[str, str] = {}
+        preset_axes = getattr(self, "_normalized_axis_columns", None)
+        if isinstance(preset_axes, dict):
+            for axis_label, column in preset_axes.items():
+                if column in getattr(self.current_df, "columns", []):
+                    axis_cols[axis_label] = column
+
         for axis_label, axis_char in (("X", "x"), ("Y", "y"), ("Z", "z")):
+            if axis_label in axis_cols:
+                continue
             candidates: List[str] = []
             for col in self.current_df.columns:
                 if col == time_col:
+                    continue
+                if col in axis_cols.values():
                     continue
                 try:
                     series = self.current_df[col]
@@ -7950,21 +7977,218 @@ class MainApp:
 
 
 
+    def _normalize_vibration_dataframe(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, str]]:
+        """Normaliza columnas de tiempo/ejes para datasets industriales o de laboratorio."""
+
+        if df is None or getattr(df, "empty", True):
+            return df, None, {}
+
+        normalized_df = df.copy()
+        column_names = [str(col) for col in normalized_df.columns]
+        lower_map = {col: str(col).strip().lower() for col in column_names}
+
+        def _unique_name(base: str) -> str:
+            candidate = base
+            suffix = 1
+            while candidate in normalized_df.columns:
+                candidate = f"{base}_{suffix}"
+                suffix += 1
+            return candidate
+
+        time_keywords = (
+            "time",
+            "t_s",
+            "tiempo",
+            "sample",
+            "timestamp",
+            "time[s]",
+            "t (s)",
+        )
+
+        time_col: Optional[str] = None
+        for name in column_names:
+            lower = lower_map.get(name, "")
+            if any(keyword in lower for keyword in time_keywords):
+                time_col = name
+                break
+
+        numeric_cols = [
+            name
+            for name in column_names
+            if pd.api.types.is_numeric_dtype(normalized_df[name])
+        ]
+
+        if time_col is None:
+            for name in numeric_cols:
+                lower = lower_map.get(name, "")
+                if lower.startswith("t") or lower.endswith("time"):
+                    time_col = name
+                    break
+
+        target_time_col: Optional[str]
+        if time_col is not None:
+            time_series = pd.to_numeric(normalized_df[time_col], errors="coerce")
+            if time_series.isna().all():
+                try:
+                    time_series = pd.to_datetime(normalized_df[time_col], errors="coerce")
+                    if not time_series.isna().all():
+                        base = time_series.dropna().iloc[0]
+                        time_series = (time_series - base).dt.total_seconds()
+                except Exception:
+                    pass
+            if isinstance(time_series, pd.Series):
+                time_values = time_series.to_numpy(dtype=float)
+            else:
+                time_values = np.asarray(time_series, dtype=float)
+            if not np.isfinite(time_values).any():
+                time_values = np.arange(len(normalized_df), dtype=float) / 10000.0
+            target_time_col = str(time_col)
+            normalized_df[target_time_col] = time_values
+        else:
+            target_time_col = "time"
+            if target_time_col in normalized_df.columns:
+                target_time_col = _unique_name(target_time_col)
+            normalized_df[target_time_col] = np.arange(len(normalized_df), dtype=float) / 10000.0
+
+        axis_candidates: Dict[str, List[Tuple[int, str]]] = {"X": [], "Y": [], "Z": []}
+        general_candidates: List[Tuple[int, str]] = []
+        column_index = {name: idx for idx, name in enumerate(column_names)}
+
+        def _score_axis(name: str, axis_char: str) -> int:
+            lower = name.lower()
+            tokens = [tok for tok in re.split(r"[^a-z0-9]+", lower) if tok]
+            score = 0
+            if axis_char in tokens:
+                score += 4
+            if f"axis{axis_char}" in tokens or f"{axis_char}axis" in tokens:
+                score += 3
+            if any(tok.startswith(axis_char) for tok in tokens):
+                score += 2
+            if f"acc{axis_char}" in lower or f"a{axis_char}" in lower:
+                score += 3
+            if lower.endswith(axis_char) or lower.startswith(axis_char):
+                score += 1
+            if any(keyword in lower for keyword in ("acc", "acel", "vib", "vel", "disp", "ms2", "g")):
+                score += 2
+            return score
+
+        numeric_like: Dict[str, pd.Series] = {}
+        for name in column_names:
+            if name == target_time_col:
+                continue
+            series = pd.to_numeric(normalized_df[name], errors="coerce")
+            if series.notna().sum() < max(3, int(0.02 * len(series))):
+                continue
+            numeric_like[name] = series
+            lower = lower_map.get(name, "")
+            if any(keyword in lower for keyword in ("acc", "acel", "vib", "vel", "ms2", "g")):
+                general_candidates.append((5, name))
+            for axis_label, axis_char in (("X", "x"), ("Y", "y"), ("Z", "z")):
+                score = _score_axis(name, axis_char)
+                if score > 0:
+                    axis_candidates[axis_label].append((score, name))
+
+        used_cols: Set[str] = set()
+        detected_axes: Dict[str, str] = {}
+        for axis_label in ("X", "Y", "Z"):
+            candidates = axis_candidates.get(axis_label, [])
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], -column_index.get(item[1], 0)), reverse=True)
+                for _, candidate_name in candidates:
+                    if candidate_name in used_cols:
+                        continue
+                    detected_axes[axis_label] = candidate_name
+                    used_cols.add(candidate_name)
+                    break
+
+        if "X" not in detected_axes and general_candidates:
+            general_candidates.sort(key=lambda item: (-item[0], column_index.get(item[1], 0)))
+            for _, candidate_name in general_candidates:
+                if candidate_name in used_cols:
+                    continue
+                detected_axes["X"] = candidate_name
+                used_cols.add(candidate_name)
+                break
+
+        if not detected_axes and numeric_cols:
+            for name in numeric_cols:
+                if name == target_time_col:
+                    continue
+                detected_axes["X"] = name
+                break
+
+        normalized_axes: Dict[str, str] = {}
+        for axis_label, source_col in detected_axes.items():
+            canonical_col = f"acc{axis_label}"
+            if str(source_col) == canonical_col:
+                target_col = canonical_col
+            else:
+                target_col = canonical_col if canonical_col not in normalized_df.columns else _unique_name(canonical_col)
+            source_series = numeric_like.get(
+                source_col,
+                pd.to_numeric(normalized_df[source_col], errors="coerce"),
+            )
+            normalized_df[target_col] = source_series.astype(float)
+            normalized_axes[axis_label] = target_col
+
+        for axis_label in ("X", "Y", "Z"):
+            col_name = f"acc{axis_label}"
+            if col_name not in normalized_df.columns:
+                normalized_df[col_name] = np.nan
+
+        return normalized_df, target_time_col, normalized_axes
+
+    def _load_vibration_csv(
+        self,
+        file_path: str,
+    ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, str]]:
+        """Carga un CSV de vibraciones manejando formatos industriales o de laboratorio."""
+
+        last_error: Optional[Exception] = None
+        read_attempts = (
+            {},
+            {"sep": ";"},
+            {"sep": None, "engine": "python"},
+        )
+
+        for params in read_attempts:
+            try:
+                df = pd.read_csv(file_path, **params)
+                if getattr(df, "empty", False):
+                    continue
+                return self._normalize_vibration_dataframe(df)
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+
+        empty_df = pd.DataFrame()
+        return empty_df, None, {}
+
     def _load_file_data(self, file_path):
 
         try:
 
+            normalized_time: Optional[str] = None
+            normalized_axes: Dict[str, str] = {}
+
             if file_path.endswith('.csv'):
 
-                df = pd.read_csv(file_path)
+                df, normalized_time, normalized_axes = self._load_vibration_csv(file_path)
 
             elif file_path.endswith('.xlsx'):
 
                 df = pd.read_excel(file_path)
+                df, normalized_time, normalized_axes = self._normalize_vibration_dataframe(df)
 
             else:
 
                 df = pd.read_csv(file_path)
+                df, normalized_time, normalized_axes = self._normalize_vibration_dataframe(df)
 
 
 
@@ -7996,9 +8220,34 @@ class MainApp:
 
             time_candidates = [c for c in numeric_cols if "t" in c.lower()]
 
-            self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
+            default_time = None
+            if normalized_time and normalized_time in numeric_cols:
+                default_time = normalized_time
+            elif self.default_time_col and self.default_time_col in numeric_cols:
+                default_time = self.default_time_col
+            elif time_candidates:
+                default_time = time_candidates[0]
+            elif numeric_cols:
+                default_time = numeric_cols[0]
 
-            self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
+            self.default_time_col = default_time
+
+            preferred_signals = [col for col in normalized_axes.values() if col in numeric_cols]
+            if not preferred_signals:
+                preferred_signals = [
+                    c
+                    for c in numeric_cols
+                    if c != self.default_time_col and pd.to_numeric(df[c], errors="coerce").notna().any()
+                ]
+            if not preferred_signals:
+                preferred_signals = [c for c in numeric_cols if c != self.default_time_col]
+
+            self.default_signal_cols = preferred_signals
+            self._normalized_axis_columns = normalized_axes or {}
+
+            if normalized_axes:
+                formatted_axes = ", ".join(f"{axis}: {col}" for axis, col in normalized_axes.items())
+                self._log(f"Ejes detectados: {formatted_axes}")
 
 
 
