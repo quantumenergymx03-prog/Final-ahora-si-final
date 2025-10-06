@@ -1041,6 +1041,8 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        self._last_axis_columns: Dict[str, str] = {}
+        self._last_axis_rms: Dict[str, float] = {}
 
 
 
@@ -2173,6 +2175,19 @@ class MainApp:
             mask = (t >= start_t) & (t <= end_t)
             t_seg, sig_seg = t[mask], signal[mask]
 
+            axis_columns = self._get_axis_columns()
+            axis_segments = self._get_axis_data(mask, axis_columns)
+            axis_rms = None
+            if axis_segments:
+                axis_rms = self._calculate_rms_axes(
+                    t_seg,
+                    axis_segments.get("X"),
+                    axis_segments.get("Y"),
+                    axis_segments.get("Z"),
+                )
+            self._last_axis_columns = axis_columns
+            self._last_axis_rms = axis_rms or {}
+
             def compute_fft_dual(y, tv):
                 N = len(y)
                 if N < 2:
@@ -2330,9 +2345,17 @@ class MainApp:
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
+            text_color = "black"
             try:
                 rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
+                ax1.text(
+                    0.02,
+                    0.95,
+                    f"RMS acc: {rms_acc:.3e} m/s²",
+                    transform=ax1.transAxes,
+                    va="top",
+                    color=text_color,
+                )
             except Exception:
                 pass
 
@@ -2344,10 +2367,19 @@ class MainApp:
 
             # Anotar RMS conforme a la unidad seleccionada
             try:
-                text_color = "white" if self.is_dark_mode else "black"
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va="top", color=text_color)
+                ax1.text(
+                    0.02,
+                    0.95,
+                    _rms_text,
+                    transform=ax1.transAxes,
+                    va="top",
+                    color=text_color,
+                )
             except Exception:
                 pass
+
+            if axis_rms:
+                self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
             img_time = save_plot(fig1)
 
             try:
@@ -2816,6 +2848,25 @@ class MainApp:
             _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
+
+            if axis_rms and axis_columns:
+                axis_table_data = [["Eje", "RMS (mm/s)"]]
+                for axis_label in ("X", "Y", "Z"):
+                    if axis_label in axis_columns and axis_label in axis_rms:
+                        col_name = axis_columns.get(axis_label, axis_label)
+                        axis_table_data.append([
+                            f"{axis_label} ({col_name})",
+                            f"{axis_rms[axis_label]:.2f}",
+                        ])
+                if len(axis_table_data) > 1:
+                    axis_table_data.append([
+                        "Global (vectorial)",
+                        f"{axis_rms.get('Global', 0.0):.2f}",
+                    ])
+                    axis_table = Table(axis_table_data, colWidths=[200, 200])
+                    _apply_table_style(axis_table)
+                    elements.append(axis_table)
+                    elements.append(Spacer(1, 12))
 
             elements.append(Image(img_time, width=400, height=150))
             elements.append(Image(img_fft, width=400, height=150))
@@ -4814,6 +4865,225 @@ class MainApp:
         """
         return np.sqrt(np.mean(signal**2))
 
+    def _calculate_band_rms_mm(
+        self,
+        time_s: np.ndarray,
+        acc_ms2: Optional[np.ndarray],
+        f_lo: float = 10.0,
+        f_hi: float = 1000.0,
+    ) -> float:
+        """Calcula RMS de velocidad [mm/s] dentro de una banda (ISO 10816)."""
+
+        if acc_ms2 is None:
+            return 0.0
+
+        t = np.asarray(time_s, dtype=float)
+        y = np.asarray(acc_ms2, dtype=float)
+
+        if t.size < 2 or y.size < 2:
+            return 0.0
+
+        n = min(t.size, y.size)
+        if n < 2:
+            return 0.0
+
+        t = t[:n]
+        y = y[:n]
+
+        dt = float(np.mean(np.diff(t))) if n > 1 else 0.0
+        if not np.isfinite(dt) or dt <= 0.0:
+            return 0.0
+
+        xf = np.fft.rfftfreq(n, dt)
+        if xf.size == 0:
+            return 0.0
+
+        y_fft = np.fft.rfft(y)
+        v_fft = np.zeros_like(y_fft, dtype=complex)
+        pos = xf > 0
+        if np.any(pos):
+            v_fft[pos] = y_fft[pos] / (1j * 2.0 * np.pi * xf[pos])
+
+        band_mask = (xf >= float(f_lo)) & (xf <= float(f_hi))
+        if not np.any(band_mask):
+            return 0.0
+
+        v_band = np.where(band_mask, v_fft, 0.0)
+        v_t = np.fft.irfft(v_band, n=n)
+        if v_t.size == 0:
+            return 0.0
+
+        rms_vel_mm = 1000.0 * float(np.sqrt(np.mean(np.square(v_t))))
+        if not np.isfinite(rms_vel_mm):
+            return 0.0
+        return rms_vel_mm
+
+    def _calculate_rms_axes(
+        self,
+        time_s: np.ndarray,
+        acc_x: Optional[np.ndarray] = None,
+        acc_y: Optional[np.ndarray] = None,
+        acc_z: Optional[np.ndarray] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Calcula RMS por eje (X, Y, Z) y global vectorial en 10–1000 Hz."""
+
+        t = np.asarray(time_s, dtype=float)
+        if t.size < 2:
+            return None
+
+        axis_values: Dict[str, float] = {}
+        for axis_key, data in (("X", acc_x), ("Y", acc_y), ("Z", acc_z)):
+            if data is None:
+                continue
+            arr = np.asarray(data, dtype=float)
+            if arr.size < 2:
+                continue
+            n = min(arr.size, t.size)
+            if n < 2:
+                continue
+            rms_val = self._calculate_band_rms_mm(t[:n], arr[:n])
+            axis_values[axis_key] = float(rms_val)
+
+        if not axis_values:
+            return None
+
+        global_val = float(np.sqrt(np.sum(np.square(list(axis_values.values())))))
+        axis_values["Global"] = global_val
+        return axis_values
+
+    def _plot_rms_summary(self, ax, rms_dict: Optional[Dict[str, float]], text_color: str = "white"):
+        """Inserta en la gráfica un resumen de RMS por eje y global."""
+
+        if ax is None or not rms_dict:
+            return
+        try:
+            txt = (
+                f"RMS X: {rms_dict.get('X', 0.0):.2f} mm/s | "
+                f"RMS Y: {rms_dict.get('Y', 0.0):.2f} mm/s | "
+                f"RMS Z: {rms_dict.get('Z', 0.0):.2f} mm/s | "
+                f"Global: {rms_dict.get('Global', 0.0):.2f} mm/s"
+            )
+            ax.text(
+                0.02,
+                0.93,
+                txt,
+                transform=ax.transAxes,
+                va="top",
+                color=text_color,
+                fontsize=10,
+            )
+        except Exception:
+            pass
+
+    def _is_axis_column(self, name: str, axis_char: str) -> bool:
+        lower = str(name or "").lower()
+        axis_char = str(axis_char).lower()
+        if not lower or not axis_char:
+            return False
+
+        direct = {
+            axis_char,
+            f"a{axis_char}",
+            f"acc{axis_char}",
+            f"acc_{axis_char}",
+            f"vel{axis_char}",
+            f"vel_{axis_char}",
+        }
+        if lower in direct:
+            return True
+
+        patterns = (
+            f"_{axis_char}",
+            f"{axis_char}_",
+            f"axis_{axis_char}",
+            f"{axis_char}axis",
+            f"{axis_char}-axis",
+            f"{axis_char} axis",
+            f"channel_{axis_char}",
+            f"{axis_char} channel",
+        )
+        if any(pat in lower for pat in patterns):
+            return True
+
+        if lower.endswith(axis_char) and any(tag in lower for tag in ("acc", "vel", "disp", "vib")):
+            return True
+
+        return False
+
+    def _get_axis_columns(self) -> Dict[str, str]:
+        if self.current_df is None:
+            return {}
+
+        try:
+            time_col = getattr(self.time_dropdown, "value", None)
+        except Exception:
+            time_col = None
+
+        axis_cols: Dict[str, str] = {}
+        for axis_label, axis_char in (("X", "x"), ("Y", "y"), ("Z", "z")):
+            candidates: List[str] = []
+            for col in self.current_df.columns:
+                if col == time_col:
+                    continue
+                try:
+                    series = self.current_df[col]
+                    dtype = series.dtype
+                except Exception:
+                    continue
+                if not np.issubdtype(dtype, np.number):
+                    continue
+                if self._is_axis_column(col, axis_char):
+                    candidates.append(str(col))
+            if not candidates:
+                continue
+
+            def _score(name: str) -> int:
+                nm = name.lower()
+                score = 0
+                if nm.startswith("acc"):
+                    score += 4
+                if "acc" in nm:
+                    score += 2
+                if nm.startswith("vel"):
+                    score += 3
+                if "vel" in nm or "spd" in nm:
+                    score += 1
+                if nm.startswith(f"a{axis_char}"):
+                    score += 2
+                if nm.endswith(f"_{axis_char}") or nm.endswith(axis_char):
+                    score += 1
+                return score
+
+            best = max(candidates, key=_score)
+            axis_cols[axis_label] = best
+
+        return axis_cols
+
+    def _get_axis_data(
+        self,
+        mask: Optional[np.ndarray] = None,
+        axis_columns: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, np.ndarray]:
+        if self.current_df is None:
+            return {}
+
+        cols = axis_columns if axis_columns is not None else self._get_axis_columns()
+        if not cols:
+            return {}
+
+        data: Dict[str, np.ndarray] = {}
+        for axis_label, column in cols.items():
+            if column not in self.current_df.columns:
+                continue
+            series = pd.to_numeric(self.current_df[column], errors="coerce").to_numpy(dtype=float)
+            if mask is not None and series.size == mask.size:
+                series = series[mask]
+            series = np.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
+            if series.size < 2:
+                continue
+            data[axis_label] = series
+        return data
+
     def _format_peak_label(self, freq_hz: float, amp_mm_s: float, order: float | None = None, unit: str = "mm/s") -> str:
         label = f"{freq_hz:.2f} Hz | {amp_mm_s:.3f} {unit}"
         try:
@@ -5881,9 +6151,18 @@ class MainApp:
 
                 return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
-
-
-
+            axis_columns = self._get_axis_columns()
+            axis_segments = self._get_axis_data(mask, axis_columns)
+            axis_rms = None
+            if axis_segments:
+                axis_rms = self._calculate_rms_axes(
+                    t_segment,
+                    axis_segments.get("X"),
+                    axis_segments.get("Y"),
+                    axis_segments.get("Z"),
+                )
+            self._last_axis_columns = axis_columns
+            self._last_axis_rms = axis_rms or {}
 
             # --- Features + diagnóstico baseline ---
 
@@ -6056,14 +6335,24 @@ class MainApp:
 
             ax1.set_ylabel("Aceleración [m/s²]")
 
+            text_color = "white" if self.is_dark_mode else "black"
+
             # Anotar RMS de Aceleracion (tiempo)
             try:
-                text_color = "white" if self.is_dark_mode else "black"
                 rms_acc = self._calculate_rms(signal_segment)
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes,
-                         va="top", color=text_color)
+                ax1.text(
+                    0.02,
+                    0.95,
+                    _rms_text,
+                    transform=ax1.transAxes,
+                    va="top",
+                    color=text_color,
+                )
             except Exception:
                 pass
+
+            if axis_rms:
+                self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
 
 
             # Aplicar filtros visuales de frecuencia (LF y/o límite HF)
