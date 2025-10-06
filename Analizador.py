@@ -5792,14 +5792,66 @@ class MainApp:
             rms_mm = 0.0
             sev_label = 'N/D'
 
-        # Enfoque
+        # Enfoque y severidad global
         lines.append("Enfoque: motor eléctrico")
 
-        # Severidad
         try:
             lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
         except Exception:
             pass
+
+        axis_rms = getattr(self, "_last_axis_rms", {}) or {}
+
+        def _sev_rank(value: float) -> int:
+            try:
+                v = float(value)
+            except Exception:
+                return -1
+            if not np.isfinite(v) or v < 0:
+                return -1
+            if v <= 2.8:
+                return 0
+            if v <= 4.5:
+                return 1
+            if v <= 7.1:
+                return 2
+            return 3
+
+        if axis_rms:
+            axis_parts: List[str] = []
+            worst_axis: Optional[str] = None
+            worst_rank = -1
+            for axis_label in ("X", "Y", "Z", "Global"):
+                if axis_label not in axis_rms:
+                    continue
+                try:
+                    value = float(axis_rms.get(axis_label, 0.0))
+                except Exception:
+                    value = 0.0
+                info = self._iso_severity_light(value)
+                axis_parts.append(
+                    f"{info['emoji']} {axis_label}: {value:.2f} mm/s ({info['label']})"
+                )
+                rank = _sev_rank(value)
+                if rank > worst_rank:
+                    worst_rank = rank
+                    worst_axis = axis_label
+            if axis_parts:
+                lines.append(
+                    "RMS por eje (10–1000 Hz): " + " | ".join(axis_parts)
+                )
+            if worst_axis:
+                if worst_axis == "Global" and worst_rank >= 0:
+                    if worst_rank >= 3:
+                        lines.append("Acción inmediata: detener y corregir, el RMS global está en zona D (inaceptable).")
+                    elif worst_rank == 2:
+                        lines.append("Planifica una intervención a corto plazo: el RMS global se ubica en zona C (insatisfactoria).")
+                    elif worst_rank == 1:
+                        lines.append("Mantén vigilancia estrecha: el RMS global está en zona B, recomienda seguimiento frecuente.")
+                elif worst_rank >= 1:
+                    lines.append(
+                        f"Prioriza mediciones y ajustes sobre el eje {worst_axis}: su RMS supera la zona A y domina la condición."
+                    )
 
         # Energía por bandas
         try:
@@ -8091,6 +8143,14 @@ class MainApp:
                 time_values = time_series.to_numpy(dtype=float)
             else:
                 time_values = np.asarray(time_series, dtype=float)
+            # Reubicar el eje temporal para que siempre inicie en 0 s
+            if time_values.size:
+                try:
+                    base_time = float(np.nanmin(time_values))
+                except (ValueError, TypeError):
+                    base_time = 0.0
+                if np.isfinite(base_time):
+                    time_values = time_values - base_time
             if not np.isfinite(time_values).any():
                 time_values = np.arange(len(normalized_df), dtype=float) / 10000.0
             target_time_col = str(time_col)
