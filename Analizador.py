@@ -2189,6 +2189,30 @@ class MainApp:
                     axis_segments.get("Y"),
                     axis_segments.get("Z"),
                 )
+            elif getattr(self, "uploaded_files", None):
+                try:
+                    raw_df, _, _ = self._load_vibration_csv(self.uploaded_files[0])
+                    time_s = raw_df.get("time")
+                    if time_s is not None:
+                        time_vals = pd.to_numeric(time_s, errors="coerce").to_numpy(dtype=float)
+                        acc_x = (
+                            pd.to_numeric(raw_df.get("accX"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accX" in raw_df.columns
+                            else None
+                        )
+                        acc_y = (
+                            pd.to_numeric(raw_df.get("accY"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accY" in raw_df.columns
+                            else None
+                        )
+                        acc_z = (
+                            pd.to_numeric(raw_df.get("accZ"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accZ" in raw_df.columns
+                            else None
+                        )
+                        axis_rms = self._calculate_rms_axes(time_vals, acc_x, acc_y, acc_z)
+                except Exception as exc:
+                    print(f"Error calculando RMS por ejes (PDF): {exc}")
             self._last_axis_columns = axis_columns
             self._last_axis_rms = axis_rms or {}
 
@@ -6260,6 +6284,30 @@ class MainApp:
                     axis_segments.get("Y"),
                     axis_segments.get("Z"),
                 )
+            elif getattr(self, "uploaded_files", None):
+                try:
+                    raw_df, _, _ = self._load_vibration_csv(self.uploaded_files[0])
+                    time_s = raw_df.get("time")
+                    if time_s is not None:
+                        time_vals = pd.to_numeric(time_s, errors="coerce").to_numpy(dtype=float)
+                        acc_x = (
+                            pd.to_numeric(raw_df.get("accX"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accX" in raw_df.columns
+                            else None
+                        )
+                        acc_y = (
+                            pd.to_numeric(raw_df.get("accY"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accY" in raw_df.columns
+                            else None
+                        )
+                        acc_z = (
+                            pd.to_numeric(raw_df.get("accZ"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accZ" in raw_df.columns
+                            else None
+                        )
+                        axis_rms = self._calculate_rms_axes(time_vals, acc_x, acc_y, acc_z)
+                except Exception as exc:
+                    print(f"Error calculando RMS por ejes: {exc}")
             self._last_axis_columns = axis_columns
             self._last_axis_rms = axis_rms or {}
 
