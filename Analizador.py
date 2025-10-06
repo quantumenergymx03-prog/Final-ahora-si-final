@@ -8,6 +8,7 @@ import numpy as np
 from datetime import datetime
 import matplotlib
 import re
+import warnings
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -4994,19 +4995,19 @@ class MainApp:
             value = float("nan")
 
         if not np.isfinite(value) or value < 0:
-            return {"label": "Sin datos", "color": "#7f8c8d", "emoji": "⚪"}
+            return {"label": "Sin datos", "color": "#7f8c8d", "emoji": "○"}
 
         thresholds = (
-            (2.8, "Zona A - Buena", "#2ecc71", "🟢"),
-            (4.5, "Zona B - Satisfactoria", "#f1c40f", "🟡"),
-            (7.1, "Zona C - Insatisfactoria", "#e67e22", "🟠"),
+            (2.8, "Zona A - Buena", "#2ecc71", "●"),
+            (4.5, "Zona B - Satisfactoria", "#f1c40f", "●"),
+            (7.1, "Zona C - Insatisfactoria", "#e67e22", "●"),
         )
 
         for limit, label, color, emoji in thresholds:
             if value <= limit:
                 return {"label": label, "color": color, "emoji": emoji}
 
-        return {"label": "Zona D - Inaceptable", "color": "#e74c3c", "emoji": "🔴"}
+        return {"label": "Zona D - Inaceptable", "color": "#e74c3c", "emoji": "●"}
 
     def _build_rms_semaphore_controls(self, axis_rms: Optional[Dict[str, float]]) -> List[ft.Control]:
         """Genera tarjetas con semáforo ISO para cada eje disponible y el global."""
@@ -5052,6 +5053,18 @@ class MainApp:
         header = ft.Text("Semáforo RMS ISO 10816 (10–1000 Hz)", weight="bold")
         row = ft.Row(controls=cards, wrap=True, spacing=12, run_spacing=12)
         return [header, row]
+
+    def _safe_tight_layout(self, fig: Optional[plt.Figure]) -> None:
+        """Aplica tight_layout ignorando advertencias cuando no es posible ajustar."""
+
+        if fig is None:
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
 
     def _plot_rms_summary(self, ax, rms_dict: Optional[Dict[str, float]], text_color: str = "white"):
         """Inserta en la gráfica un resumen de RMS por eje y global."""
@@ -5412,7 +5425,7 @@ class MainApp:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
-            fig.tight_layout()
+            self._safe_tight_layout(fig)
             return fig
         except Exception:
             return None
@@ -5499,7 +5512,17 @@ class MainApp:
             except Exception:
                 std_x = std_y = None
             try:
-                corr_val = float(np.corrcoef(x_filt, y_filt)[0, 1])
+                if (
+                    std_x is not None
+                    and std_y is not None
+                    and np.isfinite(std_x)
+                    and np.isfinite(std_y)
+                    and std_x > 1e-12
+                    and std_y > 1e-12
+                ):
+                    corr_val = float(np.corrcoef(x_filt, y_filt)[0, 1])
+                else:
+                    corr_val = None
             except Exception:
                 corr_val = None
             try:
@@ -5657,7 +5680,7 @@ class MainApp:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(loc="upper right", fontsize=8)
-            fig.tight_layout()
+            self._safe_tight_layout(fig)
             return fig
         except Exception:
             return None
@@ -6911,7 +6934,7 @@ class MainApp:
 
                     aux_ax.legend()
 
-                    aux_fig.tight_layout()
+                    self._safe_tight_layout(aux_fig)
 
                     aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
                     plt.close(aux_fig)
