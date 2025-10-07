@@ -740,16 +740,27 @@ def analyze_vibration(
     peak_acc = float(np.max(np.abs(a))) if len(a) else 0.0
     pp_acc = float(np.ptp(a)) if len(a) else 0.0
     if len(mag_vel_mm) > 0:
-        # Dominante ignorando muy baja frecuencia para evitar sesgos visuales
+        # Dominante ignorando muy baja frecuencia para evitar sesgos por DC
         dom_min_hz = 0.5
-        mask_dom = xf >= dom_min_hz
-        if np.any(mask_dom):
-            rel_idx = int(np.argmax(mag_vel_mm[mask_dom]))
-            idx_dom = np.where(mask_dom)[0][rel_idx]
-        else:
-            idx_dom = int(np.argmax(mag_vel_mm))
-        dom_freq = float(xf[idx_dom])
-        dom_amp = float(mag_vel_mm[idx_dom])
+        mag_for_dom = mag_vel_mm.copy()
+        try:
+            if len(xf) == len(mag_for_dom):
+                mag_for_dom[xf < dom_min_hz] = 0.0
+        except Exception:
+            pass
+        idx_dom = int(np.argmax(mag_for_dom)) if len(mag_for_dom) else 0
+        dom_freq = float(xf[idx_dom]) if len(xf) > idx_dom else 0.0
+        dom_amp = float(mag_vel_mm[idx_dom]) if len(mag_vel_mm) > idx_dom else 0.0
+        if (dom_freq <= 0.0) and np.any(xf >= dom_min_hz):
+            try:
+                candidates = np.where(xf >= dom_min_hz)[0]
+                if candidates.size:
+                    best_idx = candidates[int(np.argmax(mag_vel_mm[candidates]))]
+                    dom_freq = float(xf[best_idx])
+                    dom_amp = float(mag_vel_mm[best_idx])
+                    idx_dom = int(best_idx)
+            except Exception:
+                pass
     else:
         dom_freq, dom_amp = 0.0, 0.0
     # Severidad basada en RMS de velocidad temporal (mm/s)
@@ -2135,6 +2146,108 @@ class MainApp:
         except Exception:
             return None
 
+    def _build_severity_traffic_light(self, rms_mm: float) -> ft.Container:
+        """Crea un semáforo visual según la severidad ISO."""
+
+        try:
+            rms_val = float(rms_mm)
+        except Exception:
+            rms_val = 0.0
+        if rms_val <= 2.8:
+            active_idx = 0
+        elif rms_val <= 4.5:
+            active_idx = 1
+        else:
+            active_idx = 2
+        colors = ["#2ecc71", "#f1c40f", "#e74c3c"]
+        labels = ["Zona A (Buena)", "Zona B (Vigilancia)", "Zona C/D (Alarma)"]
+
+        lights: List[ft.Control] = []
+        for idx, (color, label) in enumerate(zip(colors, labels)):
+            is_active = idx == active_idx
+            lights.append(
+                ft.Column(
+                    [
+                        ft.Container(
+                            width=26,
+                            height=26,
+                            bgcolor=color if is_active else ft.Colors.with_opacity(0.18, color),
+                            border=ft.border.all(2, color if is_active else ft.Colors.with_opacity(0.35, color)),
+                            border_radius=30,
+                        ),
+                        ft.Text(label, size=11, text_align=ft.TextAlign.CENTER, width=90),
+                    ],
+                    spacing=4,
+                    horizontal_alignment="center",
+                )
+            )
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Semáforo ISO", weight="bold", size=13),
+                    ft.Row(lights, alignment="spaceAround", expand=True),
+                ],
+                spacing=8,
+            ),
+            padding=ft.padding.all(10),
+            border_radius=10,
+            bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+        )
+
+    def _build_spectral_balance_widget(self, frac_low: float, frac_mid: float, frac_high: float) -> ft.Container:
+        """Visualiza la energía baja/media/alta en una barra apilada."""
+
+        safe_total = max(frac_low + frac_mid + frac_high, 1e-9)
+        portions = [
+            (max(frac_low / safe_total, 0.0), "Baja (0-30 Hz)", "#3498db"),
+            (max(frac_mid / safe_total, 0.0), "Media (30-120 Hz)", "#9b59b6"),
+            (max(frac_high / safe_total, 0.0), "Alta (>120 Hz)", "#e67e22"),
+        ]
+        bar_width = 260
+        segments: List[ft.Control] = []
+        for frac, _, color in portions:
+            width_px = max(2.0 if frac > 0 else 0.0, bar_width * frac)
+            segments.append(
+                ft.Container(
+                    width=width_px,
+                    height=14,
+                    bgcolor=color,
+                )
+            )
+        legend_items: List[ft.Control] = []
+        for frac, label, color in portions:
+            percent = max(min(frac * 100.0, 100.0), 0.0)
+            legend_items.append(
+                ft.Row(
+                    [
+                        ft.Container(width=10, height=10, bgcolor=color, border_radius=3),
+                        ft.Text(f"{label}: {percent:.1f}%", size=11),
+                    ],
+                    spacing=6,
+                    alignment="start",
+                )
+            )
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Balance espectral", weight="bold", size=13),
+                    ft.Container(
+                        content=ft.Row(segments, spacing=0, alignment="start"),
+                        width=bar_width,
+                        height=18,
+                        border_radius=6,
+                        bgcolor=ft.Colors.with_opacity(0.08, "#ffffff" if self.is_dark_mode else "#000000"),
+                        padding=ft.padding.symmetric(horizontal=2, vertical=2),
+                    ),
+                    ft.Column(legend_items, spacing=4, tight=True),
+                ],
+                spacing=8,
+            ),
+            padding=ft.padding.all(10),
+            border_radius=10,
+            bgcolor=ft.Colors.with_opacity(0.04, self._accent_ui()),
+        )
+
     def _axis_letter_from_name(self, column: Any) -> Optional[str]:
         name = str(column)
         cl = name.lower()
@@ -3059,6 +3172,31 @@ class MainApp:
                 elements.append(Spacer(1, 10))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
             elements.append(Spacer(1, 4))
+            frac_low_pdf = float(features_full.get('frac_low', 0.0))
+            frac_mid_pdf = float(features_full.get('frac_mid', 0.0))
+            frac_high_pdf = float(features_full.get('frac_high', 0.0))
+            if (frac_low_pdf + frac_mid_pdf + frac_high_pdf) > 0:
+                balance_row = [
+                    f"Baja (0-30 Hz): {frac_low_pdf * 100:.1f}%",
+                    f"Media (30-120 Hz): {frac_mid_pdf * 100:.1f}%",
+                    f"Alta (>120 Hz): {frac_high_pdf * 100:.1f}%",
+                ]
+                balance_tbl = Table([balance_row], colWidths=[150, 180, 160], hAlign="LEFT")
+                balance_tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#3498db")),
+                            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#9b59b6")),
+                            ("BACKGROUND", (2, 0), (2, 0), colors.HexColor("#e67e22")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("FONTSIZE", (0, 0), (-1, 0), 10),
+                            ("BOX", (0, 0), (-1, 0), 0.25, colors.white),
+                        ]
+                    )
+                )
+                elements.append(balance_tbl)
+                elements.append(Spacer(1, 10))
             elements.append(Paragraph(_pdf_fft_filter_note, styles['Normal']))
             elements.append(Spacer(1, 10))
             # Semáforo de severidad (actual + otros atenuados)
@@ -4391,6 +4529,30 @@ class MainApp:
             elements.append(Paragraph(f"Clasificacion ISO: {severity_mm}", styles['Normal']))
             elements.append(Paragraph(f"RMS velocidad: {rms_mm:.3f} mm/s", styles['Normal']))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
+            frac_low_pdf2 = float(features_full.get('frac_low', 0.0))
+            frac_mid_pdf2 = float(features_full.get('frac_mid', 0.0))
+            frac_high_pdf2 = float(features_full.get('frac_high', 0.0))
+            if (frac_low_pdf2 + frac_mid_pdf2 + frac_high_pdf2) > 0:
+                balance_row2 = [
+                    f"Baja (0-30 Hz): {frac_low_pdf2 * 100:.1f}%",
+                    f"Media (30-120 Hz): {frac_mid_pdf2 * 100:.1f}%",
+                    f"Alta (>120 Hz): {frac_high_pdf2 * 100:.1f}%",
+                ]
+                balance_tbl2 = Table([balance_row2], colWidths=[150, 180, 160], hAlign="LEFT")
+                balance_tbl2.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#3498db")),
+                            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#9b59b6")),
+                            ("BACKGROUND", (2, 0), (2, 0), colors.HexColor("#e67e22")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("FONTSIZE", (0, 0), (-1, 0), 10),
+                            ("BOX", (0, 0), (-1, 0), 0.25, colors.white),
+                        ]
+                    )
+                )
+                elements.append(balance_tbl2)
             elements.append(Paragraph(_pdf_fft_filter_note2, styles['Normal']))
             elements.append(Spacer(1, 8))
             elements.append(Paragraph("Diagnóstico:", styles['SectionHeading']))
@@ -6406,6 +6568,9 @@ class MainApp:
             "e_mid": e_mid,
             "e_high": e_high,
             "e_total": total_energy,
+            "frac_low": (e_low / total_energy) if total_energy > 0 else 0.0,
+            "frac_mid": (e_mid / total_energy) if total_energy > 0 else 0.0,
+            "frac_high": (e_high / total_energy) if total_energy > 0 else 0.0,
             "rms_vel_spec": rms_vel_spec,
         }
 
@@ -7413,6 +7578,8 @@ class MainApp:
                             f"Frecuencia dominante: {dom_freq:.2f} Hz",
                             text_align=ft.TextAlign.LEFT,
                         ),
+                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
                         *axis_summary_controls_exec,
                         ft.Text(
                             "Hallazgos clave",
@@ -7478,6 +7645,8 @@ class MainApp:
                             f"RMS velocidad global: {primary_rms_mm:.3f} mm/s",
                             text_align=ft.TextAlign.LEFT,
                         ),
+                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
                         *axis_summary_controls_main,
                         ft.Text(
                             "Crest factor (aceleración): "
@@ -9008,9 +9177,73 @@ class MainApp:
         return pd.DataFrame(data)
 
 
+    def _reset_analysis_state_on_new_file(self):
+        """Limpia resultados y caches para evitar arrastre entre archivos."""
+
+        # Reset de datos numéricos y caches espectrales
+        self.current_df = None
+        self.signal_unit_map = {}
+        self._last_axis_severity = []
+        self._last_primary_severity = None
+        self._last_xf = None
+        self._last_spec = None
+        self._last_tseg = None
+        self._last_accseg = None
+        self._fft_zoom_range = None
+        self._fft_full_range = None
+        self._fft_zoom_syncing = False
+        self._fft_display_scale = 1.0
+        self._fft_display_unit = "Hz"
+
+        # Restablecer combinaciones vectoriales
+        try:
+            self.combine_signals_enabled = False
+            if hasattr(self, "combine_signals_cb") and self.combine_signals_cb is not None:
+                self.combine_signals_cb.value = False
+                if getattr(self.combine_signals_cb, "page", None):
+                    self.combine_signals_cb.update()
+        except Exception:
+            pass
+        try:
+            for cb in getattr(self, "signal_checkboxes", []) or []:
+                cb.value = False
+                if getattr(cb, "page", None):
+                    cb.update()
+        except Exception:
+            pass
+
+        # Limpiar contenedores visuales principales
+        try:
+            if hasattr(self, "chart_container") and self.chart_container is not None:
+                self.chart_container.content = ft.Column(
+                    [
+                        ft.Icon(ft.Icons.INSIGHTS, color=self._accent_ui()),
+                        ft.Text("Carga un archivo para generar nuevas gráficas", size=14),
+                    ],
+                    horizontal_alignment="center",
+                    alignment="center",
+                    spacing=8,
+                )
+                if getattr(self.chart_container, "page", None):
+                    self.chart_container.update()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "multi_chart_container") and self.multi_chart_container is not None:
+                self.multi_chart_container.content = ft.Text(
+                    "Selecciona canales para visualizar después de cargar un archivo."
+                )
+                if getattr(self.multi_chart_container, "page", None):
+                    self.multi_chart_container.update()
+        except Exception:
+            pass
+
+
     def _load_file_data(self, file_path):
 
         try:
+
+            self._reset_analysis_state_on_new_file()
 
             calibrations = self._gather_calibration_settings()
 
