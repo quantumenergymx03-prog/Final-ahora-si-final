@@ -17,6 +17,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
+import unicodedata
 from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
@@ -5732,85 +5733,135 @@ class MainApp:
         return selected
 
     def _build_explanations(self, res: Dict[str, Any], findings: List[str]) -> List[str]:
-        """
-        Genera una lista de líneas de "Explicación y recomendaciones" basadas en:
-        - Resultado unificado del analizador `res` (rms, severidad, energía por bandas).
-        - Hallazgos principales seleccionados (findings) para orientar motivos y revisiones.
-        """
-        lines: List[str] = []
+        """Genera una única revisión con motivo y acción alineados a ISO."""
+
+        def _normalize(text: str) -> str:
+            if text is None:
+                return ""
+            normalized = unicodedata.normalize("NFD", str(text))
+            return normalized.encode("ascii", "ignore").decode("ascii").lower()
+
+        explanations: List[str] = []
         try:
-            sev = res.get('severity', {})
-            rms_mm = float(sev.get('rms_mm_s', 0.0))
-            sev_label = str(sev.get('label', 'N/D'))
+            severity = res.get("severity", {}) if isinstance(res, dict) else {}
+            iso_label = str(severity.get("label", "Sin clasificación ISO"))
+            try:
+                rms_val = float(severity.get("rms_mm_s", 0.0))
+                rms_txt = f"{rms_val:.3f} mm/s"
+            except Exception:
+                rms_val = None
+                rms_txt = "N/D"
+
+            iso_contexts = [
+                {"key": "Buena", "zone": "Zona A", "range": "≤ 2.8 mm/s"},
+                {"key": "Satisfactoria", "zone": "Zona B", "range": "2.8 – 4.5 mm/s"},
+                {"key": "Insatisfactoria", "zone": "Zona C", "range": "4.5 – 7.1 mm/s"},
+                {"key": "Inaceptable", "zone": "Zona D", "range": "> 7.1 mm/s"},
+            ]
+            zone_clause = None
+            for ctx in iso_contexts:
+                if ctx["key"].lower() in iso_label.lower():
+                    zone_clause = f"{ctx['zone']} ({ctx['range']})"
+                    break
+            severity_clause = iso_label
+            if zone_clause:
+                severity_clause = f"{iso_label} – {zone_clause}"
+            if rms_val is not None:
+                severity_clause = f"{severity_clause} con {rms_txt}"
+
+            normalized_findings = [str(item).strip() for item in (findings or []) if str(item).strip()]
+            main_finding = normalized_findings[0] if normalized_findings else ""
+            main_norm = _normalize(main_finding)
+
+            profiles = [
+                {
+                    "keywords": ["desbalanceo"],
+                    "reason": "Predominio del armónico 1X y energía concentrada en baja frecuencia.",
+                    "action": "Programar balanceo dinámico y revisar acoplamientos y sujeciones.",
+                    "charlotte": "Tabla Charlotte – EM01 Desbalanceo del rotor",
+                },
+                {
+                    "keywords": ["desalineacion", "desalineaci"],
+                    "reason": "Armónicos 2X/3X elevados respecto a 1X según la severidad ISO.",
+                    "action": "Verificar alineación angular/paralela y rigidez de la base.",
+                    "charlotte": "Tabla Charlotte – EM02/EM03 Desalineación",
+                },
+                {
+                    "keywords": ["holgura"],
+                    "reason": "Múltiples armónicos de 1X con modulación que indica holgura mecánica.",
+                    "action": "Inspeccionar fijaciones, tolerancias y aprietes estructurales.",
+                    "charlotte": "Tabla Charlotte – EM04 Holgura mecánica",
+                },
+                {
+                    "keywords": ["engran"],
+                    "reason": "Componentes de malla y bandas laterales asociadas al tren de engranes.",
+                    "action": "Revisar desgaste de dientes, juego y lubricación del engranaje.",
+                    "charlotte": "Tabla Charlotte – EM19 Problemas en acoplamiento/engranes",
+                },
+                {
+                    "keywords": ["rodamiento"],
+                    "reason": "Picos en envolvente en BPFO/BPFI/BSF/FTF compatibles con daño de rodamiento.",
+                    "action": "Evaluar lubricación, holguras y condición de pistas y elementos rodantes.",
+                    "charlotte": "Tabla Charlotte – EM14–EM17 Fallas en rodamientos",
+                },
+                {
+                    "keywords": ["electrico", "linea"],
+                    "reason": "Componentes a la frecuencia de línea y su 2X excediendo la zona ISO.",
+                    "action": "Balancear fases, revisar variador y conexiones del estator.",
+                    "charlotte": "Tabla Charlotte – EM12/EM13 Problemas eléctricos",
+                },
+                {
+                    "keywords": ["resonancia"],
+                    "reason": "Picos agudos con factor Q alto fuera de armónicos cinemáticos conocidos.",
+                    "action": "Verificar rigidez estructural y considerar prueba modal/FRF.",
+                    "charlotte": "Tabla Charlotte – EM06 Resonancia estructural",
+                },
+            ]
+
+            selected_profile = None
+            for profile in profiles:
+                if any(keyword in main_norm for keyword in profile["keywords"]):
+                    selected_profile = profile
+                    break
+            if not selected_profile and main_norm.startswith("sin anomalia"):
+                selected_profile = {
+                    "reason": "Los niveles de vibración se mantienen dentro de los límites aceptables de la ISO.",
+                    "action": "Continuar con monitoreo rutinario y verificación periódica de condiciones.",
+                    "charlotte": None,
+                }
+            if not selected_profile:
+                selected_profile = {
+                    "reason": "No se identificó una anomalía predominante en la evaluación automática.",
+                    "action": "Corroborar parámetros operativos y asegurar montaje correcto antes de intervenir.",
+                    "charlotte": None,
+                }
+
+            energy_text = None
+            try:
+                energy = res.get("fft", {}).get("energy", {}) if isinstance(res, dict) else {}
+                total = float(energy.get("total", 0.0))
+                if total > 0:
+                    low = float(energy.get("low", 0.0)) / total
+                    mid = float(energy.get("mid", 0.0)) / total
+                    high = float(energy.get("high", 0.0)) / total
+                    energy_text = f"Energía espectral: baja {low:.0%}, media {mid:.0%}, alta {high:.0%}."
+            except Exception:
+                energy_text = None
+
+            parts: List[str] = [f"Revisión ISO 10816/20816 – {severity_clause}."]
+            if selected_profile.get("reason"):
+                parts.append(f"Motivo principal: {selected_profile['reason']}")
+            if selected_profile.get("action"):
+                parts.append(f"Acción recomendada: {selected_profile['action']}")
+            if selected_profile.get("charlotte"):
+                parts.append(f"Referencia: {selected_profile['charlotte']}.")
+            if energy_text:
+                parts.append(energy_text)
+
+            explanations.append(" ".join(parts))
         except Exception:
-            rms_mm = 0.0
-            sev_label = 'N/D'
-
-        # Enfoque
-        lines.append("Enfoque: motor eléctrico")
-
-        # Severidad
-        try:
-            lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
-        except Exception:
-            pass
-
-        # Energía por bandas
-        try:
-            en = res.get('fft', {}).get('energy', {})
-            e_total = float(en.get('total', 1e-12))
-            fl = float(en.get('low', 0.0)) / e_total if e_total > 0 else 0.0
-            fm = float(en.get('mid', 0.0)) / e_total if e_total > 0 else 0.0
-            fh = float(en.get('high', 0.0)) / e_total if e_total > 0 else 0.0
-            lines.append(f"Distribución de energía: baja {fl:.0%}, media {fm:.0%}, alta {fh:.0%}.")
-        except Exception:
-            pass
-
-        # Helper para buscar presencia robusta (variantes de acentos/codificación)
-        def _has_any(keys: List[str]) -> bool:
-            for f in (findings or []):
-                try:
-                    s = str(f)
-                except Exception:
-                    continue
-                for k in keys:
-                    if k in s:
-                        return True
-            return False
-
-        # Recomendaciones por patrón
-        if _has_any(["Desbalanceo"]):
-            lines += [
-                "Motivo: 1X dominante con 2X/3X bajos y energía LF.",
-                "Revisar: balanceo de rotor/acoplamiento, fijaciones, suciedad/excentricidad.",
-            ]
-        if _has_any(["Desalineaci", "Desalineación", "Desalineacion"]):
-            lines += [
-                "Motivo: armónicos 2X/3X elevados respecto a 1X.",
-                "Revisar: alineación de ejes, calces y base.",
-            ]
-        if _has_any(["Engranes", "Engranaje"]):
-            lines += [
-                "Motivo: componente de malla apreciable.",
-                "Revisar: desgaste, juego y lubricación.",
-            ]
-        if _has_any(["Rodamientos", "Rodamiento"]):
-            lines += [
-                "Motivo: picos en envolvente en frecuencias del rodamiento.",
-                "Revisar: lubricación, holgura y daño en pistas/elementos.",
-            ]
-        if _has_any(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
-            lines += [
-                "Motivo: componentes a frecuencia de línea y/o su 2x.",
-                "Revisar: balance de fases, variador, conexiones y carga del motor.",
-            ]
-        if _has_any(["Resonancia estructural", "Resonancia"]):
-            lines += [
-                "Motivo: picos agudos con Q alto.",
-                "Revisar: rigidez/apoyos, aprietes, prueba modal/FRF.",
-            ]
-
-        return lines
+            explanations.append("Revisión ISO 10816/20816 – información no disponible. Verifique los datos de entrada.")
+        return explanations
 
     def _resolve_analysis_period(
         self, time_vector: np.ndarray
@@ -7018,23 +7069,35 @@ class MainApp:
                         value_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
                     except Exception:
                         value_txt = "N/D"
+                    color_hex = entry.get("color", "#7f8c8d")
                     controls.append(
-                        ft.Row(
-                            [
-                                ft.Text(
-                                    entry.get("name", "Eje"),
-                                    weight="bold" if entry.get("is_global") else None,
-                                ),
-                                ft.Text(value_txt),
-                                ft.Container(
-                                    width=12,
-                                    height=12,
-                                    bgcolor=entry.get("color", "#7f8c8d"),
-                                    border_radius=6,
-                                ),
-                                ft.Text(entry.get("iso_label", "N/D")),
-                            ],
-                            alignment="spaceBetween",
+                        ft.Container(
+                            content=ft.Row(
+                                [
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.TIMELAPSE,
+                                                size=16,
+                                                color=color_hex,
+                                            ),
+                                            ft.Text(
+                                                entry.get("name", "Eje"),
+                                                weight="bold" if entry.get("is_global") else None,
+                                            ),
+                                        ],
+                                        spacing=6,
+                                        alignment="start",
+                                    ),
+                                    ft.Text(value_txt, weight="bold"),
+                                    ft.Text(entry.get("iso_label", "N/D"), color=color_hex),
+                                ],
+                                alignment="spaceBetween",
+                                vertical_alignment="center",
+                            ),
+                            border=ft.border.all(1, color_hex),
+                            border_radius=8,
+                            padding=ft.padding.symmetric(horizontal=12, vertical=8),
                         )
                     )
                 return controls
@@ -7052,58 +7115,105 @@ class MainApp:
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
             resumen_exec = ft.Container(
-                content=ft.Column([
-                    ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
-                    ft.Row([
-                        ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
-                        ft.Text(f"Clasificación ISO: {sev_label}")
-                    ]),
-                    ft.Text(f"RMS velocidad: {primary_rms_mm:.3f} mm/s"),
-                    *axis_summary_controls_exec,
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                    ft.Text("Diagnóstico:"),
-                    *[ft.Text(f"- {it}") for it in exec_findings],
-                ], spacing=6),
-                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                border_radius=10,
-                padding=10
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.ANALYTICS, color=self._accent_ui()),
+                                ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Container(
+                            content=ft.Row(
+                                [
+                                ft.Icon(ft.Icons.SPEED, color=sev_color),
+                                    ft.Text(f"Clasificación ISO: {sev_label}", weight="bold"),
+                                ],
+                                spacing=8,
+                                alignment="start",
+                            ),
+                            bgcolor=ft.Colors.with_opacity(0.12, sev_color),
+                            border_radius=20,
+                            padding=ft.padding.symmetric(horizontal=14, vertical=8),
+                        ),
+                        ft.Text(f"RMS global (mm/s): {primary_rms_mm:.3f}", weight="bold"),
+                        ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                        *axis_summary_controls_exec,
+                        ft.Text("Hallazgos clave", weight="bold"),
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
+                                        ft.Text(text),
+                                    ],
+                                    spacing=6,
+                                    alignment="start",
+                                )
+                                for text in exec_findings
+                            ],
+                            spacing=4,
+                        ),
+                    ],
+                    spacing=10,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                border_radius=12,
+                padding=ft.padding.all(16),
             )
 
             # --- Panel resumen + diagnóstico ---
 
             resumen = ft.Container(
-
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {primary_rms_mm:.3f} mm/s"),
-
-                    *axis_summary_controls_main,
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
-
-                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
-                border_radius=10,
-
-                padding=10
-
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.INSIGHTS, color=self._accent_ui()),
+                                ft.Text("Resumen del análisis", size=18, weight="bold"),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Text(f"Periodo analizado: {start_t:.2f}s – {end_t:.2f}s"),
+                        ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                        ft.Text(f"RMS velocidad global: {primary_rms_mm:.3f} mm/s"),
+                        *axis_summary_controls_main,
+                        ft.Text(
+                            "Crest factor (aceleración): "
+                            f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}"
+                        ),
+                        ft.Divider(),
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.FACT_CHECK, color=self._accent_ui()),
+                                ft.Text("Diagnóstico automático (baseline)", size=16, weight="bold"),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
+                                        ft.Text(text),
+                                    ],
+                                    spacing=6,
+                                    alignment="start",
+                                )
+                                for text in findings
+                            ],
+                            spacing=4,
+                        ),
+                    ],
+                    spacing=10,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                border_radius=12,
+                padding=ft.padding.all(16),
             )
 
 
@@ -7120,10 +7230,13 @@ class MainApp:
             _fft_filter_note = f"Filtro visual FFT: oculta < {_fc:.2f} Hz" if _hide_lf else "Filtro visual FFT: sin ocultar"
 
             # Recalcular explicaciones con helper unificado (evita divergencias)
+            exp_lines: List[str] = []
             try:
                 exp_lines = self._build_explanations(res, findings)
             except Exception:
-                pass
+                exp_lines = []
+            if not exp_lines:
+                exp_lines = ["Revisión ISO 10816/20816 – sin información disponible."]
 
             # --- Contenedor con scroll (en Column, no en Container) ---
 
@@ -7136,13 +7249,36 @@ class MainApp:
                     controls=[
                         resumen_exec,
                     ft.Container(
-                        content=ft.Column([
-                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                            *[ft.Text(f"- {it}") for it in exp_lines],
-                        ], spacing=6),
-                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                        border_radius=10,
-                        padding=10,
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.LIGHTBULB, color=self._accent_ui()),
+                                        ft.Text("Explicación y revisión sugerida", size=16, weight="bold"),
+                                    ],
+                                    spacing=8,
+                                    alignment="start",
+                                ),
+                                ft.Column(
+                                    [
+                                        ft.Row(
+                                            [
+                                                ft.Icon(ft.Icons.CHECK_CIRCLE, color=self._accent_ui(), size=18),
+                                                ft.Text(line),
+                                            ],
+                                            spacing=6,
+                                            alignment="start",
+                                        )
+                                        for line in exp_lines
+                                    ],
+                                    spacing=6,
+                                ),
+                            ],
+                            spacing=10,
+                        ),
+                        bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                        border_radius=12,
+                        padding=ft.padding.all(16),
                     ),
                     ft.Text(_fft_filter_note),
                     chart
