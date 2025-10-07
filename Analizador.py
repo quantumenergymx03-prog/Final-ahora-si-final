@@ -5601,6 +5601,25 @@ class MainApp:
             return f"Zoom FFT: completo ({min_txt} - {max_txt} {unit})"
         return f"Zoom FFT: {start_txt} - {end_txt} {unit}"
 
+    def _apply_fft_display_units(
+        self,
+        full_range: Optional[Tuple[float, float]],
+        zoom_range: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        """Selecciona Hz o kHz según el rango visible en la FFT."""
+
+        freq_max: Optional[float] = None
+        for rng in (zoom_range, full_range):
+            if rng and len(rng) == 2 and rng[1] > rng[0] and np.isfinite(rng[1]):
+                freq_max = float(rng[1])
+                break
+        if freq_max is not None and freq_max >= 1500.0:
+            self._fft_display_scale = 1000.0
+            self._fft_display_unit = "kHz"
+        else:
+            self._fft_display_scale = 1.0
+            self._fft_display_unit = "Hz"
+
     def _update_fft_zoom_controls(self, full_range: Optional[Tuple[float, float]], current_range: Optional[Tuple[float, float]]):
         slider = getattr(self, 'fft_zoom_slider', None)
         label = getattr(self, 'fft_zoom_text', None)
@@ -5626,6 +5645,7 @@ class MainApp:
             else:
                 start_val = max(min_val, min(current_range[0], max_val))
                 end_val = max(start_val + 1e-6, min(current_range[1], max_val))
+            self._apply_fft_display_units(full_range, (start_val, end_val))
             if slider:
                 slider.min = min_val
                 slider.max = max_val
@@ -5652,6 +5672,7 @@ class MainApp:
             return
         label = getattr(self, 'fft_zoom_text', None)
         if label and self._fft_full_range:
+            self._apply_fft_display_units(self._fft_full_range, (start, end))
             label.value = self._format_fft_zoom_label(start, end, self._fft_full_range)
             if label.page:
                 label.update()
@@ -5796,8 +5817,8 @@ class MainApp:
     ) -> Tuple[np.ndarray, float, float]:
         """Calcula el periodo válido de análisis según la UI y devuelve la máscara correspondiente.
 
-        Si el usuario no especifica un rango, se recorta automáticamente una ventana de
-        hasta 3 segundos desde el inicio para evitar analizar capturas excesivamente largas.
+        Respeta el rango seleccionado por el usuario; si no se especifica inicio/fin,
+        analiza todo el registro disponible.
         """
         t_arr = np.asarray(time_vector, dtype=float).ravel()
         if t_arr.size == 0:
@@ -5808,8 +5829,6 @@ class MainApp:
         t_valid = t_arr[valid]
         full_start = float(np.nanmin(t_valid))
         full_end = float(np.nanmax(t_valid))
-        total_span = max(0.0, full_end - full_start)
-        default_window = 3.0
         start_val: Optional[float] = None
         end_val: Optional[float] = None
         try:
@@ -5828,13 +5847,6 @@ class MainApp:
         end_t = end_val if end_val is not None else full_end
         start_t = min(max(start_t, full_start), full_end)
         end_t = min(max(end_t, full_start), full_end)
-        if total_span > default_window:
-            if start_val is None and end_val is None:
-                end_t = min(full_end, start_t + default_window)
-            elif start_val is not None and end_val is None:
-                end_t = min(full_end, max(start_t, start_t + default_window))
-            elif end_val is not None and start_val is None:
-                start_t = max(full_start, end_t - default_window)
         if start_val is not None and end_val is not None and end_t <= start_t:
             start_t, end_t = end_t, start_t
         if end_t <= start_t:
@@ -6410,37 +6422,32 @@ class MainApp:
                         full_max = float(arr.max())
                         if full_max > full_min:
                             self._fft_full_range = (full_min, full_max)
-                            self._fft_display_scale = 1.0
-                            self._fft_display_unit = "Hz"
                             current_zoom = self._fft_zoom_range
                             if current_zoom is not None:
                                 start_val = max(full_min, min(current_zoom[0], full_max))
                                 end_val = max(start_val + 1e-6, min(current_zoom[1], full_max))
                                 self._fft_zoom_range = (start_val, end_val)
+                            self._apply_fft_display_units(self._fft_full_range, self._fft_zoom_range)
                             self._update_fft_zoom_controls(self._fft_full_range, self._fft_zoom_range)
                         else:
                             self._fft_full_range = None
                             self._fft_zoom_range = None
-                            self._fft_display_scale = 1.0
-                            self._fft_display_unit = "Hz"
+                            self._apply_fft_display_units(None, None)
                             self._update_fft_zoom_controls(None, None)
                     else:
                         self._fft_full_range = None
                         self._fft_zoom_range = None
-                        self._fft_display_scale = 1.0
-                        self._fft_display_unit = "Hz"
+                        self._apply_fft_display_units(None, None)
                         self._update_fft_zoom_controls(None, None)
                 except Exception:
                     self._fft_full_range = None
                     self._fft_zoom_range = None
-                    self._fft_display_scale = 1.0
-                    self._fft_display_unit = "Hz"
+                    self._apply_fft_display_units(None, None)
                     self._update_fft_zoom_controls(None, None)
             else:
                 self._fft_full_range = None
                 self._fft_zoom_range = None
-                self._fft_display_scale = 1.0
-                self._fft_display_unit = "Hz"
+                self._apply_fft_display_units(None, None)
                 self._update_fft_zoom_controls(None, None)
             dom_freq = res['fft']['dom_freq_hz']
             dom_amp = res['fft']['dom_amp_mm_s']
@@ -6511,24 +6518,65 @@ class MainApp:
                     return any((txt in s) for s in (findings or []))
                 except Exception:
                     return False
+            charlotte_refs = {
+                "Desbalanceo": "EM01 – Desbalanceo del rotor",
+                "Desalineaci": "EM02/EM03 – Desalineación (angular/paralela)",
+                "Holgura": "EM04 – Holgura mecánica",
+                "Engranes": "EM19 – Problemas en acoplamiento/engranes",
+                "Rodamientos": "EM14–EM17 – Fallas en rodamientos",
+                "Elctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "Eléctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "El?ctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "Resonancia": "EM06 – Resonancia estructural",
+            }
+
+            def _charlotte_line(key: str) -> Optional[str]:
+                ref = charlotte_refs.get(key)
+                return f"Tabla Charlotte: {ref}." if ref else None
+
             if _has("Desbalanceo"):
                 exp_lines.append("Motivo: 1X dominante, 2X/3X bajos y energía concentrada en baja frecuencia.")
                 exp_lines.append("Revisar: balanceo del rotor/acoplamiento, fijaciones y suciedad/excentricidad.")
+                ref_line = _charlotte_line("Desbalanceo")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Desalineaci"):
                 exp_lines.append("Motivo: armónicos 2X/3X elevados respecto a 1X.")
                 exp_lines.append("Revisar: alineación de ejes, calces y planitud de la base.")
+                ref_line = _charlotte_line("Desalineaci")
+                if ref_line:
+                    exp_lines.append(ref_line)
+            if _has("Holgura"):
+                exp_lines.append("Motivo: múltiples armónicos de 1X significativos en el espectro.")
+                exp_lines.append("Revisar: sujeciones, tolerancias mecánicas y posibles juegos en componentes.")
+                ref_line = _charlotte_line("Holgura")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Engranes"):
                 exp_lines.append("Motivo: componente de malla de engranajes apreciable.")
                 exp_lines.append("Revisar: desgaste de dientes, juego y lubricación.")
+                ref_line = _charlotte_line("Engranes")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Rodamientos"):
                 exp_lines.append("Motivo: picos en envolvente en frecuencias características de rodamientos.")
                 exp_lines.append("Revisar: lubricación, holgura y posible daño en pistas/elementos.")
-            if _has("Elctrico") or _has("Eléctrico") or _has("El?ctrico"):
+                ref_line = _charlotte_line("Rodamientos")
+                if ref_line:
+                    exp_lines.append(ref_line)
+            if _has("Elctrico") or _has("Eléctrico") or _has("El?ctrico"):
                 exp_lines.append("Motivo: componentes a frecuencia de línea y/o su 2x.")
                 exp_lines.append("Revisar: balance de fases, variador, conexiones y carga del motor.")
+                for key in ("Elctrico", "Eléctrico", "El?ctrico"):
+                    ref_line = _charlotte_line(key)
+                    if ref_line and ref_line not in exp_lines:
+                        exp_lines.append(ref_line)
             if _has("Resonancia estructural"):
                 exp_lines.append("Motivo: picos agudos con Q alto fuera de armónicos conocidos.")
                 exp_lines.append("Revisar: rigidez/soportes, aprietes y realizar prueba modal/FRF si es posible.")
+                ref_line = _charlotte_line("Resonancia")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if frac_low + frac_mid + frac_high > 0:
                 try:
                     exp_lines.append(f"Distribución de energía: baja {frac_low:.0%}, media {frac_mid:.0%}, alta {frac_high:.0%} (guía del tipo de fallo).")
@@ -8216,34 +8264,38 @@ class MainApp:
         scale_to_seconds = 1.0
         finite_raw = t_raw[np.isfinite(t_raw)]
         span_raw = 0.0
+        max_abs_raw = 0.0
+        median_dt: Optional[float] = None
         if finite_raw.size:
-            diffs_raw = np.diff(np.sort(finite_raw))
+            finite_sorted = np.sort(finite_raw)
+            diffs_raw = np.diff(finite_sorted)
             diffs_raw = diffs_raw[np.isfinite(diffs_raw)]
             if diffs_raw.size:
-                median_dt = float(np.nanmedian(diffs_raw))
-            else:
-                median_dt = 0.0
-            span_raw = float(np.nanmax(finite_raw) - np.nanmin(finite_raw)) if finite_raw.size > 1 else 0.0
+                median_candidate = float(np.nanmedian(np.abs(diffs_raw)))
+                if np.isfinite(median_candidate) and median_candidate > 0:
+                    median_dt = median_candidate
+            span_raw = float(finite_sorted[-1] - finite_sorted[0]) if finite_sorted.size > 1 else 0.0
             max_abs_raw = float(np.nanmax(np.abs(finite_raw)))
 
-            if (
-                median_dt >= 1e4
-                or span_raw >= 1e8
-                or max_abs_raw >= 1e12
-            ):
-                scale_to_seconds = 1e9  # Timestamp en ns
-            elif (
-                median_dt >= 1e1
-                or span_raw >= 1e5
-                or max_abs_raw >= 1e9
-            ):
-                scale_to_seconds = 1e6  # Timestamp en µs
-            elif (
-                median_dt >= 1.0
-                or span_raw >= 1e3
-                or max_abs_raw >= 1e6
-            ):
-                scale_to_seconds = 1e3  # Timestamp en ms
+        def _infer_scale(dt: Optional[float], span: float, max_abs: float) -> float:
+            if dt is not None:
+                if dt >= 5e4:
+                    return 1e9  # ns
+                if dt >= 5e1:
+                    return 1e6  # µs
+                if dt >= 5e-1:
+                    return 1e3  # ms
+                return 1.0
+            if span > 0 or max_abs > 0:
+                if span >= 5e11 or max_abs >= 5e11:
+                    return 1e9
+                if span >= 5e8 or max_abs >= 5e8:
+                    return 1e6
+                if span >= 5e5 or max_abs >= 5e5:
+                    return 1e3
+            return 1.0
+
+        scale_to_seconds = _infer_scale(median_dt, span_raw, max_abs_raw)
 
         if scale_to_seconds != 1.0:
             t = t_raw / scale_to_seconds
