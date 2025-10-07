@@ -2380,13 +2380,16 @@ class MainApp:
             t = self.current_df[time_col].to_numpy()
             signal = self.current_df[fft_signal_col].to_numpy()
 
-            try:
-                start_t = float(self.start_time_field.value) if getattr(self.start_time_field, "value", None) else t[0]
-                end_t = float(self.end_time_field.value) if getattr(self.end_time_field, "value", None) else t[-1]
-            except Exception:
-                start_t, end_t = t[0], t[-1]
-            mask = (t >= start_t) & (t <= end_t)
-            t_seg_raw, sig_seg_raw = t[mask], signal[mask]
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                self._log("Periodo seleccionado inválido; se utilizará el rango completo.")
+                mask = np.isfinite(np.asarray(t, dtype=float))
+                start_t = float(np.nanmin(t[mask])) if np.any(mask) else 0.0
+                end_t = float(np.nanmax(t[mask])) if np.any(mask) else 0.0
+            segment_idx = np.nonzero(mask)[0]
+            t_seg_raw = t[segment_idx]
+            sig_seg_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
             t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
             def compute_fft_dual(y, tv):
@@ -2814,8 +2817,8 @@ class MainApp:
                     y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
                     if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
                         try:
-                            x_seg_pdf = self.current_df.loc[mask, x_col].to_numpy()
-                            y_seg_pdf = self.current_df.loc[mask, y_col].to_numpy()
+                            x_seg_pdf = segment_df[x_col].to_numpy()
+                            y_seg_pdf = segment_df[y_col].to_numpy()
                         except Exception:
                             x_seg_pdf = self.current_df[x_col].to_numpy()
                             y_seg_pdf = self.current_df[y_col].to_numpy()
@@ -4021,19 +4024,15 @@ class MainApp:
 
             # Periodo seleccionado
 
-            try:
-
-                start_t = float(self.start_time_field.value) if self.start_time_field.value else t[0]
-
-                end_t = float(self.end_time_field.value) if self.end_time_field.value else t[-1]
-
-            except:
-
-                start_t, end_t = t[0], t[-1]
-
-            mask = (t >= start_t) & (t <= end_t)
-
-            t_seg_raw, sig_seg_raw = t[mask], signal[mask]
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                mask = np.isfinite(np.asarray(t, dtype=float))
+                start_t = float(np.nanmin(t[mask])) if np.any(mask) else 0.0
+                end_t = float(np.nanmax(t[mask])) if np.any(mask) else 0.0
+            segment_idx = np.nonzero(mask)[0]
+            t_seg_raw = t[segment_idx]
+            sig_seg_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
             t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
 
@@ -5792,6 +5791,47 @@ class MainApp:
 
         return lines
 
+    def _resolve_analysis_period(
+        self, time_vector: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
+        """Calcula el periodo válido de análisis según la UI y devuelve la máscara correspondiente."""
+        t_arr = np.asarray(time_vector, dtype=float).ravel()
+        if t_arr.size == 0:
+            return np.zeros(0, dtype=bool), 0.0, 0.0
+        valid = np.isfinite(t_arr)
+        if not np.any(valid):
+            return np.zeros_like(t_arr, dtype=bool), 0.0, 0.0
+        t_valid = t_arr[valid]
+        full_start = float(np.nanmin(t_valid))
+        full_end = float(np.nanmax(t_valid))
+        start_val: Optional[float] = None
+        end_val: Optional[float] = None
+        try:
+            raw_start = getattr(self.start_time_field, "value", None)
+            if raw_start not in (None, ""):
+                start_val = float(raw_start)
+        except Exception:
+            start_val = None
+        try:
+            raw_end = getattr(self.end_time_field, "value", None)
+            if raw_end not in (None, ""):
+                end_val = float(raw_end)
+        except Exception:
+            end_val = None
+        start_t = start_val if start_val is not None else full_start
+        end_t = end_val if end_val is not None else full_end
+        start_t = min(max(start_t, full_start), full_end)
+        end_t = min(max(end_t, full_start), full_end)
+        if start_val is not None and end_val is not None and end_t <= start_t:
+            start_t, end_t = end_t, start_t
+        if end_t <= start_t:
+            start_t, end_t = full_start, full_end
+        mask = valid & (t_arr >= start_t) & (t_arr <= end_t)
+        if np.count_nonzero(mask) < 2:
+            mask = valid.copy()
+            start_t, end_t = full_start, full_end
+        return mask.astype(bool), float(start_t), float(end_t)
+
     def _normalize_time_series(self, t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """Normaliza la serie temporal: limpia NaN, ordena, arranca en 0 y fuerza muestreo uniforme."""
         t_arr = np.asarray(t, dtype=float).ravel()
@@ -6284,21 +6324,14 @@ class MainApp:
 
             # --- Filtrar periodo ---
 
-            try:
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
-                start_t = float(self.start_time_field.value) if self.start_time_field.value else t[0]
-
-                end_t = float(self.end_time_field.value) if self.end_time_field.value else t[-1]
-
-            except:
-
-                start_t, end_t = t[0], t[-1]
-
-
-
-            mask = (t >= start_t) & (t <= end_t)
-
-            t_segment_raw, signal_segment_raw = t[mask], signal[mask]
+            segment_idx = np.nonzero(mask)[0]
+            t_segment_raw = t[segment_idx]
+            signal_segment_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
 
             t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw, fft_signal_col)
 
@@ -6841,8 +6874,8 @@ class MainApp:
                     y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
                     if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
                         try:
-                            x_seg = self.current_df.loc[mask, x_col].to_numpy()
-                            y_seg = self.current_df.loc[mask, y_col].to_numpy()
+                            x_seg = segment_df[x_col].to_numpy()
+                            y_seg = segment_df[y_col].to_numpy()
                         except Exception:
                             x_seg = self.current_df[x_col].to_numpy()
                             y_seg = self.current_df[y_col].to_numpy()
