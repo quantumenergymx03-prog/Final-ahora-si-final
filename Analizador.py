@@ -410,6 +410,43 @@ def anti_alias_and_decimate(time_s: np.ndarray,
     # Banda del FIR en fs_in: paso hasta f_max, rechazo a 0.9*Nyquist de fs_out (colchón)
     f_pass = min(f_max_hz, 0.9 * nyq_out)
     f_stop = 0.95 * nyq_out
+
+    delta_f = max(1e-9, f_stop - f_pass)
+    d_omega = 2.0 * np.pi * (delta_f / fs_in)
+    est_numtaps = int(np.ceil((max(atten_db, 0.0) - 8.0) / (2.285 * d_omega))) + 1
+    if est_numtaps % 2 == 0:
+        est_numtaps += 1
+    MAX_FIR_TAPS = 4095
+    if est_numtaps > MAX_FIR_TAPS or est_numtaps > y.size:
+        idx = np.arange(0, y.size, M)
+        if idx.size <= 1:
+            return t[::M], y[::M], fs_out, {
+                "M": int(M),
+                "numtaps": 1,
+                "fs_in": float(fs_in),
+                "fs_out": float(fs_out),
+                "f_pass_hz": float(f_pass),
+                "f_stop_hz": float(f_stop),
+                "atten_db": float(atten_db),
+                "note": "decimación directa (FIR omitido por límite de taps)",
+            }
+        seg_lengths = np.minimum(M, y.size - idx).astype(float)
+        sum_y = np.add.reduceat(y, idx)
+        sum_t = np.add.reduceat(t, idx)
+        x_dec = (sum_y / seg_lengths).astype(float)
+        t_dec = (sum_t / seg_lengths).astype(float)
+        info = {
+            "M": int(M),
+            "numtaps": int(min(est_numtaps, MAX_FIR_TAPS)),
+            "fs_in": float(fs_in),
+            "fs_out": float(fs_out),
+            "f_pass_hz": float(f_pass),
+            "f_stop_hz": float(f_stop),
+            "atten_db": float(atten_db),
+            "note": "decimación simplificada (promedio por bloques)",
+        }
+        return t_dec, x_dec, fs_out, info
+
     h = design_kaiser_lowpass(fs_in, f_pass, f_stop, atten_db=atten_db)
     gd = (len(h) - 1) // 2
 
@@ -8329,10 +8366,6 @@ class MainApp:
                 # Heurística estándar: ±2 g en 16 bits
                 return sig * (2.0 / 32768.0) * 9.80665
 
-            finite_vals = y[np.isfinite(y)]
-            mean_abs = float(np.mean(np.abs(finite_vals))) if finite_vals.size else 0.0
-            mx = float(np.max(np.abs(finite_vals))) if finite_vals.size else 0.0
-
             finite_raw = raw_values[np.isfinite(raw_values)]
             counts_like = False
             if finite_raw.size:
@@ -8400,10 +8433,6 @@ class MainApp:
                     disp = disp * 1e-3
                 return second_deriv(disp)
 
-            if mean_abs > 100.0 and mx >= 500.0:
-                return y / 1000.0
-            if mean_abs < 0.05 and mx <= 5.0:
-                return y * 9.80665
             if counts_like:
                 return convert_counts(y)
             return y
