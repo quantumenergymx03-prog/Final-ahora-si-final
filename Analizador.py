@@ -8077,11 +8077,25 @@ class MainApp:
             else:
                 median_dt = 0.0
             span_raw = float(np.nanmax(finite_raw) - np.nanmin(finite_raw)) if finite_raw.size > 1 else 0.0
-            if median_dt >= 1e6 or span_raw >= 1e9:
+            max_abs_raw = float(np.nanmax(np.abs(finite_raw)))
+
+            if (
+                median_dt >= 1e4
+                or span_raw >= 1e8
+                or max_abs_raw >= 1e12
+            ):
                 scale_to_seconds = 1e9  # Timestamp en ns
-            elif median_dt >= 1e3 or span_raw >= 1e6:
+            elif (
+                median_dt >= 1e1
+                or span_raw >= 1e5
+                or max_abs_raw >= 1e9
+            ):
                 scale_to_seconds = 1e6  # Timestamp en µs
-            elif median_dt >= 1.0 or span_raw >= 1e3:
+            elif (
+                median_dt >= 1.0
+                or span_raw >= 1e3
+                or max_abs_raw >= 1e6
+            ):
                 scale_to_seconds = 1e3  # Timestamp en ms
 
         if scale_to_seconds != 1.0:
