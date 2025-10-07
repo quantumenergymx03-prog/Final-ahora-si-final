@@ -5794,7 +5794,11 @@ class MainApp:
     def _resolve_analysis_period(
         self, time_vector: np.ndarray
     ) -> Tuple[np.ndarray, float, float]:
-        """Calcula el periodo válido de análisis según la UI y devuelve la máscara correspondiente."""
+        """Calcula el periodo válido de análisis según la UI y devuelve la máscara correspondiente.
+
+        Si el usuario no especifica un rango, se recorta automáticamente una ventana de
+        hasta 3 segundos desde el inicio para evitar analizar capturas excesivamente largas.
+        """
         t_arr = np.asarray(time_vector, dtype=float).ravel()
         if t_arr.size == 0:
             return np.zeros(0, dtype=bool), 0.0, 0.0
@@ -5804,6 +5808,8 @@ class MainApp:
         t_valid = t_arr[valid]
         full_start = float(np.nanmin(t_valid))
         full_end = float(np.nanmax(t_valid))
+        total_span = max(0.0, full_end - full_start)
+        default_window = 3.0
         start_val: Optional[float] = None
         end_val: Optional[float] = None
         try:
@@ -5822,6 +5828,13 @@ class MainApp:
         end_t = end_val if end_val is not None else full_end
         start_t = min(max(start_t, full_start), full_end)
         end_t = min(max(end_t, full_start), full_end)
+        if total_span > default_window:
+            if start_val is None and end_val is None:
+                end_t = min(full_end, start_t + default_window)
+            elif start_val is not None and end_val is None:
+                end_t = min(full_end, max(start_t, start_t + default_window))
+            elif end_val is not None and start_val is None:
+                start_t = max(full_start, end_t - default_window)
         if start_val is not None and end_val is not None and end_t <= start_t:
             start_t, end_t = end_t, start_t
         if end_t <= start_t:
@@ -6397,12 +6410,8 @@ class MainApp:
                         full_max = float(arr.max())
                         if full_max > full_min:
                             self._fft_full_range = (full_min, full_max)
-                            if full_max >= 1000.0:
-                                self._fft_display_scale = 1000.0
-                                self._fft_display_unit = "kHz"
-                            else:
-                                self._fft_display_scale = 1.0
-                                self._fft_display_unit = "Hz"
+                            self._fft_display_scale = 1.0
+                            self._fft_display_unit = "Hz"
                             current_zoom = self._fft_zoom_range
                             if current_zoom is not None:
                                 start_val = max(full_min, min(current_zoom[0], full_max))
