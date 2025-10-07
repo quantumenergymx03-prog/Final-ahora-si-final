@@ -7800,13 +7800,36 @@ class MainApp:
             data_frame["time"] = np.arange(len(data_frame), dtype=float) / 10000.0
             time_col = "time"
 
-        t = pd.to_numeric(data_frame[time_col], errors="coerce").to_numpy(dtype=float)
+        t_raw = pd.to_numeric(data_frame[time_col], errors="coerce").to_numpy(dtype=float)
+        scale_to_seconds = 1.0
+        finite_raw = t_raw[np.isfinite(t_raw)]
+        span_raw = 0.0
+        if finite_raw.size:
+            diffs_raw = np.diff(np.sort(finite_raw))
+            diffs_raw = diffs_raw[np.isfinite(diffs_raw)]
+            if diffs_raw.size:
+                median_dt = float(np.nanmedian(diffs_raw))
+            else:
+                median_dt = 0.0
+            span_raw = float(np.nanmax(finite_raw) - np.nanmin(finite_raw)) if finite_raw.size > 1 else 0.0
+            if median_dt >= 1e6 or span_raw >= 1e9:
+                scale_to_seconds = 1e9  # Timestamp en ns
+            elif median_dt >= 1e3 or span_raw >= 1e6:
+                scale_to_seconds = 1e6  # Timestamp en µs
+            elif median_dt >= 1.0 or span_raw >= 1e3:
+                scale_to_seconds = 1e3  # Timestamp en ms
+
+        if scale_to_seconds != 1.0:
+            t = t_raw / scale_to_seconds
+        else:
+            t = t_raw
+
         finite_t = t[np.isfinite(t)]
         if finite_t.size:
             t0 = float(np.min(finite_t))
             t = t - t0
         else:
-            t = np.arange(len(t), dtype=float) / 10000.0
+            t = np.arange(len(t_raw), dtype=float) / 10000.0
 
         diffs = np.diff(t[np.isfinite(t)])
         dt = float(np.nanmean(diffs)) if diffs.size else 0.0
@@ -7867,8 +7890,11 @@ class MainApp:
         def _to_ms2(series: Optional[pd.Series], header_name: Optional[str]) -> Optional[np.ndarray]:
             if series is None:
                 return None
+
+            raw_values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
             y = _interp_to_uniform(series)
             h = str(header_name or "").lower()
+            calib = _get_calibration(header_name)
 
             def deriv(sig: np.ndarray) -> np.ndarray:
                 if dt <= 0:
@@ -7881,9 +7907,41 @@ class MainApp:
                 first = deriv(sig)
                 return deriv(first)
 
+            def convert_counts(sig: np.ndarray) -> np.ndarray:
+                if calib:
+                    if "counts_per_g" in calib:
+                        g_val = sig / float(calib["counts_per_g"])
+                        return g_val * 9.80665
+                    if "g_per_count" in calib:
+                        g_val = sig * float(calib["g_per_count"])
+                        return g_val * 9.80665
+                    if "full_scale_g" in calib and "full_scale_counts" in calib:
+                        ratio = float(calib["full_scale_g"]) / float(calib["full_scale_counts"])
+                        g_val = sig * ratio
+                        return g_val * 9.80665
+                    if "mv_per_g" in calib:
+                        # Conteos calibrados mediante sensibilidad en mV/g
+                        mv = sig * 1000.0 if "v" in h and "mv" not in h else sig
+                        g_val = mv / float(calib["mv_per_g"])
+                        return g_val * 9.80665
+                # Heurística estándar: ±2 g en 16 bits
+                return sig * (2.0 / 32768.0) * 9.80665
+
             finite_vals = y[np.isfinite(y)]
             mean_abs = float(np.mean(np.abs(finite_vals))) if finite_vals.size else 0.0
             mx = float(np.max(np.abs(finite_vals))) if finite_vals.size else 0.0
+
+            finite_raw = raw_values[np.isfinite(raw_values)]
+            counts_like = False
+            if finite_raw.size:
+                max_abs_raw = float(np.nanmax(np.abs(finite_raw)))
+                frac = np.abs(finite_raw - np.round(finite_raw))
+                max_frac = float(np.nanmax(frac)) if frac.size else 0.0
+                if max_abs_raw > 50.0 and max_abs_raw <= 40000.0 and max_frac < 1e-6:
+                    counts_like = True
+
+            if re.search(r"m[/ _]?s\^?2", h):
+                return y
 
             if any(key in h for key in ["acc", "acel"]):
                 if any(key in h for key in ["mm/s2", "mmps2", "mm s^2", "mm_s2"]):
@@ -7895,13 +7953,22 @@ class MainApp:
                 if re.search(r"[^m]g\b", h) or h.endswith("_g") or " acc_g" in h:
                     return y * 9.80665
                 if any(key in h for key in ["count", "adc", "volt", "mv", " v"]):
-                    calib = _get_calibration(header_name)
-                    if calib and "mv_per_g" in calib:
-                        y_mv = y * 1000.0 if "v" in h and "mv" not in h else y
-                        g_val = y_mv / float(calib["mv_per_g"])
-                        return g_val * 9.80665
+                    if calib:
+                        if "mv_per_g" in calib:
+                            y_mv = y * 1000.0 if "v" in h and "mv" not in h else y
+                            g_val = y_mv / float(calib["mv_per_g"])
+                            return g_val * 9.80665
+                        if "counts_per_g" in calib or "g_per_count" in calib or "full_scale_g" in calib:
+                            return convert_counts(y)
                     return y
+                if counts_like:
+                    return convert_counts(y)
+                if calib and ("counts_per_g" in calib or "g_per_count" in calib or "full_scale_g" in calib):
+                    return convert_counts(y)
                 return y
+
+            if counts_like:
+                return convert_counts(y)
 
             if any(key in h for key in ["vel", "velocity"]):
                 vel = y
@@ -7921,6 +7988,8 @@ class MainApp:
                 return y / 1000.0
             if mean_abs < 0.05 and mx <= 5.0:
                 return y * 9.80665
+            if counts_like:
+                return convert_counts(y)
             return y
 
         acc_x = _to_ms2(data_frame[col_x], col_x) if col_x is not None else None
