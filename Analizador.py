@@ -7,6 +7,7 @@ from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
 import matplotlib
+import re
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -1078,6 +1079,7 @@ class MainApp:
         self.current_df = None
 
         self.file_data_storage = {}  # Almacenar datos de archivos
+        self.signal_unit_map: Dict[str, str] = {}
         self._fft_zoom_range: Optional[Tuple[float, float]] = None
         self._fft_full_range: Optional[Tuple[float, float]] = None
         self._fft_zoom_syncing = False
@@ -2187,7 +2189,7 @@ class MainApp:
                 start_t, end_t = t[0], t[-1]
             mask = (t >= start_t) & (t <= end_t)
             t_seg_raw, sig_seg_raw = t[mask], signal[mask]
-            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw)
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
             def compute_fft_dual(y, tv):
                 N = len(y)
@@ -3784,7 +3786,7 @@ class MainApp:
             mask = (t >= start_t) & (t <= end_t)
 
             t_seg_raw, sig_seg_raw = t[mask], signal[mask]
-            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw)
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
 
 
@@ -5560,9 +5562,14 @@ class MainApp:
             y_uniform = y_arr
         return uniform_t.astype(float), np.asarray(y_uniform, dtype=float), float(target_dt)
 
-    def _convert_signal_to_acceleration(self, y: np.ndarray, dt: float) -> np.ndarray:
+    def _convert_signal_to_acceleration(self, y: np.ndarray, dt: float, signal_label: Optional[str] = None) -> np.ndarray:
         """Convierte una señal (velocidad/desplazamiento/aceleración) a aceleración [m/s²]."""
-        unit = getattr(self, "input_signal_unit", "acc_ms2") or "acc_ms2"
+        unit_map = getattr(self, "signal_unit_map", {}) or {}
+        unit = None
+        if signal_label and signal_label in unit_map:
+            unit = unit_map.get(signal_label)
+        if not unit:
+            unit = getattr(self, "input_signal_unit", "acc_ms2") or "acc_ms2"
         y = np.asarray(y, dtype=float).ravel()
         if y.size == 0:
             return y
@@ -5604,11 +5611,11 @@ class MainApp:
         return np.asarray(acc, dtype=float)
 
     def _prepare_segment_for_analysis(
-        self, t: np.ndarray, y: np.ndarray
+        self, t: np.ndarray, y: np.ndarray, signal_label: Optional[str] = None
     ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         """Prepara la señal recortada para el análisis y devuelve tiempo uniforme y aceleración."""
         t_uniform, y_uniform, dt = self._normalize_time_series(t, y)
-        acc = self._convert_signal_to_acceleration(y_uniform, dt)
+        acc = self._convert_signal_to_acceleration(y_uniform, dt, signal_label)
         return t_uniform, acc, dt, y_uniform
 
     def _acc_to_vel_time_mm(self, acc: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -6023,7 +6030,7 @@ class MainApp:
 
             t_segment_raw, signal_segment_raw = t[mask], signal[mask]
 
-            t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw)
+            t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw, fft_signal_col)
 
             if len(acc_segment) < 2:
 
@@ -7738,75 +7745,243 @@ class MainApp:
 
 
 
+    def _gather_calibration_settings(self) -> Dict[str, Dict[str, float]]:
+        """Lee los campos de calibración disponibles y devuelve un mapa simple por canal."""
+        calibs: Dict[str, Dict[str, float]] = {}
+        try:
+            sens_ctrl = getattr(self, "sens_unit_dd", None)
+            sens_value_ctrl = getattr(self, "sensor_sens_field", None)
+            if sens_ctrl is None or sens_value_ctrl is None:
+                return calibs
+            sens_unit = getattr(sens_ctrl, "value", None)
+            raw_value = getattr(sens_value_ctrl, "value", None)
+            if not sens_unit or raw_value in (None, ""):
+                return calibs
+            sens_val = float(raw_value)
+            if sens_unit == "mV/g":
+                calibs["__default__"] = {"mv_per_g": sens_val}
+            elif sens_unit == "V/g":
+                calibs["__default__"] = {"mv_per_g": sens_val * 1000.0}
+        except Exception:
+            return {}
+        return calibs
+
+    def _standardize_dataset(
+        self,
+        file_path: str,
+        df: Optional[pd.DataFrame] = None,
+        calibrations: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Normaliza un dataset a aceleración [m/s²] con tiempo en 0 y muestreo uniforme.
+
+        Devuelve un DataFrame con columnas: t_s, accX_ms2, accY_ms2, accZ_ms2 (cuando existan).
+        """
+        data_frame = None
+        if df is not None:
+            data_frame = df.copy()
+        else:
+            try:
+                data_frame = pd.read_csv(file_path)
+            except Exception:
+                data_frame = pd.read_csv(file_path, sep=';')
+        if data_frame is None or data_frame.empty:
+            return None
+
+        # Detectar columna de tiempo
+        time_col = None
+        for col in data_frame.columns:
+            col_str = str(col).lower()
+            if any(key in col_str for key in ["time", "t_s", "tiempo", "timestamp", "sample"]):
+                time_col = col
+                break
+        if time_col is None:
+            data_frame = data_frame.copy()
+            data_frame["time"] = np.arange(len(data_frame), dtype=float) / 10000.0
+            time_col = "time"
+
+        t = pd.to_numeric(data_frame[time_col], errors="coerce").to_numpy(dtype=float)
+        finite_t = t[np.isfinite(t)]
+        if finite_t.size:
+            t0 = float(np.min(finite_t))
+            t = t - t0
+        else:
+            t = np.arange(len(t), dtype=float) / 10000.0
+
+        diffs = np.diff(t[np.isfinite(t)])
+        dt = float(np.nanmean(diffs)) if diffs.size else 0.0
+        if not (np.isfinite(dt) and dt > 0):
+            dt = 1.0 / 10000.0
+        t_uniform = np.arange(0, dt * len(t), dt, dtype=float)[: len(t)]
+
+        # Detección de columnas X/Y/Z
+        def _is_x(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|x|ch1)", name.lower()))
+
+        def _is_y(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|y|ch2)", name.lower()))
+
+        def _is_z(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|z|ch3)", name.lower()))
+
+        numeric_cols = [col for col in data_frame.columns if col != time_col and pd.api.types.is_numeric_dtype(data_frame[col])]
+        col_x = next((c for c in numeric_cols if _is_x(str(c)) and 'y' not in str(c).lower() and 'z' not in str(c).lower()), None)
+        col_y = next((c for c in numeric_cols if _is_y(str(c)) and 'x' not in str(c).lower() and 'z' not in str(c).lower()), None)
+        col_z = next((c for c in numeric_cols if _is_z(str(c)) and 'x' not in str(c).lower() and 'y' not in str(c).lower()), None)
+
+        others = [c for c in numeric_cols if c not in {col_x, col_y, col_z}]
+        if col_x is None and others:
+            col_x = others.pop(0)
+        if col_y is None and others:
+            col_y = others.pop(0)
+        if col_z is None and others:
+            col_z = others.pop(0)
+
+        def _interp_to_uniform(values: pd.Series) -> np.ndarray:
+            y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+            finite_mask = np.isfinite(t) & np.isfinite(y)
+            if np.count_nonzero(finite_mask) < 2:
+                return np.zeros_like(t_uniform)
+            base_t = t[finite_mask]
+            base_y = y[finite_mask]
+            order = np.argsort(base_t)
+            base_t = base_t[order]
+            base_y = base_y[order]
+            unique_t, unique_idx = np.unique(base_t, return_index=True)
+            base_y = base_y[unique_idx]
+            unique_t = unique_t.astype(float)
+            return np.interp(t_uniform, unique_t, base_y, left=base_y[0], right=base_y[-1])
+
+        def _get_calibration(name: Optional[str]) -> Optional[Dict[str, float]]:
+            if not calibrations:
+                return None
+            if name is None:
+                return calibrations.get("__default__")
+            name_str = str(name)
+            return (
+                calibrations.get(name_str)
+                or calibrations.get(name_str.lower())
+                or calibrations.get("__default__")
+            )
+
+        def _to_ms2(series: Optional[pd.Series], header_name: Optional[str]) -> Optional[np.ndarray]:
+            if series is None:
+                return None
+            y = _interp_to_uniform(series)
+            h = str(header_name or "").lower()
+
+            def deriv(sig: np.ndarray) -> np.ndarray:
+                if dt <= 0:
+                    return np.zeros_like(sig)
+                return np.gradient(sig, dt, edge_order=2 if sig.size > 2 else 1)
+
+            def second_deriv(sig: np.ndarray) -> np.ndarray:
+                if dt <= 0:
+                    return np.zeros_like(sig)
+                first = deriv(sig)
+                return deriv(first)
+
+            finite_vals = y[np.isfinite(y)]
+            mean_abs = float(np.mean(np.abs(finite_vals))) if finite_vals.size else 0.0
+            mx = float(np.max(np.abs(finite_vals))) if finite_vals.size else 0.0
+
+            if any(key in h for key in ["acc", "acel"]):
+                if any(key in h for key in ["mm/s2", "mmps2", "mm s^2", "mm_s2"]):
+                    return y / 1000.0
+                if "mg" in h:
+                    return y * 9.80665e-3
+                if "gal" in h or "cm/s2" in h:
+                    return y * 0.01
+                if re.search(r"[^m]g\b", h) or h.endswith("_g") or " acc_g" in h:
+                    return y * 9.80665
+                if any(key in h for key in ["count", "adc", "volt", "mv", " v"]):
+                    calib = _get_calibration(header_name)
+                    if calib and "mv_per_g" in calib:
+                        y_mv = y * 1000.0 if "v" in h and "mv" not in h else y
+                        g_val = y_mv / float(calib["mv_per_g"])
+                        return g_val * 9.80665
+                    return y
+                return y
+
+            if any(key in h for key in ["vel", "velocity"]):
+                vel = y
+                if any(key in h for key in ["mm/s", "mmps"]) and not any(key in h for key in ["m/s2", "mm/s2"]):
+                    vel = vel / 1000.0
+                return deriv(vel)
+
+            if any(key in h for key in ["disp", "despl", "displacement"]):
+                disp = y
+                if "µm" in h or "um" in h:
+                    disp = disp * 1e-6
+                elif re.search(r"\bmm\b", h) and not any(key in h for key in ["mm/s", "mm/s2"]):
+                    disp = disp * 1e-3
+                return second_deriv(disp)
+
+            if mean_abs > 100.0:
+                return y / 1000.0
+            if mean_abs < 0.05 and mx <= 5.0:
+                return y * 9.80665
+            return y
+
+        acc_x = _to_ms2(data_frame[col_x], col_x) if col_x is not None else None
+        acc_y = _to_ms2(data_frame[col_y], col_y) if col_y is not None else None
+        acc_z = _to_ms2(data_frame[col_z], col_z) if col_z is not None else None
+
+        data: Dict[str, np.ndarray] = {"t_s": t_uniform.astype(float)}
+        if acc_x is not None:
+            data["accX_ms2"] = np.asarray(acc_x, dtype=float)
+        if acc_y is not None:
+            data["accY_ms2"] = np.asarray(acc_y, dtype=float)
+        if acc_z is not None:
+            data["accZ_ms2"] = np.asarray(acc_z, dtype=float)
+
+        if len(data) <= 1:
+            return None
+
+        return pd.DataFrame(data)
+
+
     def _load_file_data(self, file_path):
 
         try:
 
+            calibrations = self._gather_calibration_settings()
+
+            normalized = False
+
             if file_path.endswith('.csv'):
 
-                df = pd.read_csv(file_path)
+                df_raw = pd.read_csv(file_path)
 
             elif file_path.endswith('.xlsx'):
 
-                df = pd.read_excel(file_path)
+                df_raw = pd.read_excel(file_path)
 
             else:
 
-                df = pd.read_csv(file_path)
+                df_raw = pd.read_csv(file_path)
 
+            df = df_raw
 
+            try:
+                df_std = self._standardize_dataset(file_path, df=df_raw, calibrations=calibrations)
+            except Exception as std_err:
+                self._log(f"No se pudo normalizar automáticamente {os.path.basename(file_path)}: {std_err}")
+                df_std = None
 
-            # Detectar columnas numéricas
-
-            numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-
-            if not numeric_cols:
-
-                self._log(f"Archivo inválido: {file_path} no tiene columnas numéricas")
-
-                self.page.snack_bar = ft.SnackBar(
-
-                    content=ft.Text("⚠️ El archivo no contiene columnas numéricas para análisis"),
-
-                    bgcolor="#e74c3c",
-
-                )
-
-                self.page.snack_bar.open = True
-
-                self.page.update()
-
-                return
-
-
-
-            # Columna de tiempo y señales
-
-            time_candidates = [c for c in numeric_cols if "t" in c.lower()]
-
-            self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
-
-            self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
-
-
-
-            self.file_data_storage[file_path] = df
-
-            self.current_df = df
-
-            self._log(f"Datos cargados: {file_path} ({len(df)} filas, {len(df.columns)} columnas)")
-
-
-
-            # Cambiar automáticamente a vista de análisis
-
-            self._select_menu("analysis", force_rebuild=True)
-
-
+            if df_std is not None and not df_std.empty:
+                df = df_std
+                self.signal_unit_map = {col: "acc_ms2" for col in df.columns if col != "t_s"}
+                normalized = True
+            else:
+                self.signal_unit_map = {}
 
         except Exception as e:
 
-            self._log(f"Error al cargar archivo {file_path}: {str(e)}")
+            try:
+                self._log(f"Error al leer archivo {file_path}: {str(e)}")
+            except Exception:
+                pass
 
             self.page.snack_bar = ft.SnackBar(
 
@@ -7819,6 +7994,64 @@ class MainApp:
             self.page.snack_bar.open = True
 
             self.page.update()
+
+            return
+
+
+        # Detectar columnas numéricas
+
+        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+        if not numeric_cols:
+
+            self._log(f"Archivo inválido: {file_path} no tiene columnas numéricas")
+
+            self.page.snack_bar = ft.SnackBar(
+
+                content=ft.Text("⚠️ El archivo no contiene columnas numéricas para análisis"),
+
+                bgcolor="#e74c3c",
+
+            )
+
+            self.page.snack_bar.open = True
+
+            self.page.update()
+
+            return
+
+
+
+        # Columna de tiempo y señales
+
+        time_candidates = [c for c in numeric_cols if "t" in str(c).lower()]
+
+        self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
+
+        self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
+
+
+
+        self.file_data_storage[file_path] = df
+
+        self.current_df = df
+
+        try:
+            self.input_signal_unit = "acc_ms2"
+            if getattr(self, "input_signal_unit_dd", None):
+                self.input_signal_unit_dd.value = "acc_ms2"
+                self.input_signal_unit_dd.update()
+        except Exception:
+            pass
+
+        status_msg = "Datos cargados y normalizados" if normalized else "Datos cargados"
+        self._log(f"{status_msg}: {file_path} ({len(df)} filas, {len(df.columns)} columnas)")
+
+
+
+        # Cambiar automáticamente a vista de análisis
+
+        self._select_menu("analysis", force_rebuild=True)
 
 
 
@@ -8129,7 +8362,7 @@ class MainApp:
                 for sig in selected_signals:
 
                     y_raw = self.current_df[sig].to_numpy()
-                    t_sig, acc_sig, _, _ = self._prepare_segment_for_analysis(t, y_raw)
+                    t_sig, acc_sig, _, _ = self._prepare_segment_for_analysis(t, y_raw, sig)
                     if acc_sig.size < 2 or t_sig.size != acc_sig.size:
                         continue
                     try:
