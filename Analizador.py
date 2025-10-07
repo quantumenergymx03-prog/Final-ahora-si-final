@@ -147,6 +147,46 @@ CHARLOTTE_MOTOR_FAULTS: List[Dict[str, str]] = [
 ]
 
 
+def _resolve_fft_window(window_name: Optional[str]) -> str:
+    """Normaliza el nombre de ventana FFT a un identificador soportado."""
+
+    try:
+        name = str(window_name or "").strip().lower()
+    except Exception:
+        name = ""
+    if name in {"flat-top", "flat_top", "flat top", "flattop"}:
+        return "flattop"
+    return "hann"
+
+
+def _build_fft_window(window_name: Optional[str], n: int) -> Tuple[np.ndarray, float]:
+    """Genera la ventana solicitada y su ganancia coherente (media)."""
+
+    if n <= 0:
+        return np.zeros(0, dtype=float), 1.0
+    if n == 1:
+        return np.ones(1, dtype=float), 1.0
+    name = _resolve_fft_window(window_name)
+    if name == "flattop":
+        k = np.arange(n, dtype=float)
+        denom = float(n - 1) if n > 1 else 1.0
+        angle = 2.0 * np.pi * k / denom
+        window = (
+            1.0
+            - 1.93 * np.cos(angle)
+            + 1.29 * np.cos(2.0 * angle)
+            - 0.388 * np.cos(3.0 * angle)
+            + 0.0322 * np.cos(4.0 * angle)
+        )
+    else:
+        window = np.hanning(n)
+    window = np.asarray(window, dtype=float)
+    cg = float(np.mean(window)) if np.any(window) else 1.0
+    if not np.isfinite(cg) or abs(cg) < 1e-12:
+        cg = 1.0
+    return window, cg
+
+
 def _charlotte_faults_lines() -> List[str]:
     """Devuelve las descripciones formateadas de las fallas Charlotte para motores."""
     lines: List[str] = []
@@ -502,6 +542,7 @@ def analyze_vibration(
     min_bins: int = 2,
     min_snr_db: float = 6.0,
     top_k_peaks: int = 5,
+    fft_window: str = "hann",
 ) -> Dict[str, Any]:
     def _to_1d(x: np.ndarray) -> np.ndarray:
         x = np.asarray(x).astype(float).ravel()
@@ -526,6 +567,8 @@ def analyze_vibration(
         dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.0
         fs = 1.0 / dt if dt > 0 else 0.0
         return fs, dt
+    window_type = _resolve_fft_window(fft_window)
+
     def _acc_fft_to_vel_mm_s(y: np.ndarray, dt: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """
         Calcula espectro de aceleración y velocidad (mm/s) usando rFFT con ventana Hann
@@ -537,9 +580,13 @@ def analyze_vibration(
         if N < 2 or dt <= 0:
             return np.array([]), np.array([]), np.array([]), 0.0
 
-        # Espectro para visualización (ventana Hann + corrección de ganancia)
-        w = np.hanning(N)
-        cg = w.mean() if w.mean() != 0 else 1.0
+        # Espectro para visualización (ventana seleccionada + corrección de ganancia)
+        w, cg = _build_fft_window(window_type, N)
+        if w.size != N:
+            w = np.hanning(N)
+            cg = float(np.mean(w)) if np.any(w) else 1.0
+            if not np.isfinite(cg) or abs(cg) < 1e-12:
+                cg = 1.0
         Yw = np.fft.rfft(y * w)
         xf = np.fft.rfftfreq(N, dt)
 
@@ -898,9 +945,11 @@ def analyze_vibration(
             "peaks": peaks_fft,
             "dom_freq_hz": dom_freq,
             "dom_amp_mm_s": dom_amp,
+            "rms_vel_mm_s": rms_vel_spec_mm,
             "r2x": r2x,
             "r3x": r3x,
             "energy": {"low": e_low, "mid": e_mid, "high": e_high, "total": e_total},
+            "window": window_type,
         },
         "envelope": {
             "f_hz": xf_env,
@@ -1080,6 +1129,11 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        try:
+            stored_fft_window = self.page.client_storage.get("fft_window_type")
+        except Exception:
+            stored_fft_window = None
+        self.fft_window_type = _resolve_fft_window(stored_fft_window)
         try:
             stored_input_unit = self.page.client_storage.get("input_signal_unit")
         except Exception:
@@ -2198,6 +2252,7 @@ class MainApp:
                     pre_decimate_to_fmax_hz=pre_decimate_hz,
                     env_bp_lo_hz=env_lo,
                     env_bp_hi_hz=env_hi,
+                    fft_window=self.fft_window_type,
                 )
                 axis_rms = float(res_axis.get("severity", {}).get("rms_mm_s", 0.0))
                 iso_label = res_axis.get("severity", {}).get("label", "N/D")
@@ -2466,6 +2521,7 @@ class MainApp:
                 pre_decimate_to_fmax_hz=_fmax_pre,
                 env_bp_lo_hz=env_lo_val,
                 env_bp_hi_hz=env_hi_val,
+                fft_window=self.fft_window_type,
             )
             xf = res['fft']['f_hz']
             mag_vel_mm = res['fft']['vel_spec_mm_s']
@@ -2794,6 +2850,10 @@ class MainApp:
                     runup_enabled = bool(getattr(self, 'runup_3d_enabled', False))
                 if runup_enabled:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    try:
+                        full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
+                    except Exception:
+                        full_t_uniform, full_acc_uniform = None, None
                     runup_fig = self._generate_runup_3d_figure(
                         t_seg,
                         acc_seg,
@@ -2802,6 +2862,9 @@ class MainApp:
                         fmax_ui,
                         zoom_tuple,
                         False,
+                        full_t_uniform,
+                        full_acc_uniform,
+                        self.fft_window_type,
                     )
                     if runup_fig is not None:
                         img_runup = save_plot(runup_fig)
@@ -4754,6 +4817,17 @@ class MainApp:
             on_change=self._on_fft_color_change,
         )
 
+        self.fft_window_dd = ft.Dropdown(
+            label="Ventana FFT",
+            options=[
+                ft.dropdown.Option("hann", "Hann"),
+                ft.dropdown.Option("flattop", "Flat-Top"),
+            ],
+            value=self.fft_window_type,
+            width=160,
+            on_change=self._on_fft_window_change,
+        )
+
 
 
 
@@ -4900,7 +4974,7 @@ class MainApp:
                 ft.Text("⏱️ Periodo de análisis", size=14, weight="bold"),
                 ft.Row([self.start_time_field, self.end_time_field], spacing=10),
                 ft.Text("Opciones de espectro", size=14, weight="bold"),
-                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.runup_3d_cb], spacing=10, wrap=True),
+                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.fft_window_dd, self.runup_3d_cb], spacing=10, wrap=True),
                 ft.Row([self.orbit_cb, self.orbit_x_dd, self.orbit_y_dd], spacing=10, wrap=True),
                 ft.Column([self.fft_zoom_text, self.fft_zoom_slider], spacing=4),
                 ft.Text("Escala y calibración", size=14, weight="bold"),
@@ -5269,12 +5343,39 @@ class MainApp:
         fmax_ui: Optional[float],
         zoom_range: Optional[Tuple[float, float]],
         dark_mode: bool,
+        fallback_time: Optional[np.ndarray] = None,
+        fallback_signal: Optional[np.ndarray] = None,
+        window_type: Optional[str] = None,
     ):
         try:
-            t = np.asarray(t_segment, dtype=float).ravel()
-            y = np.asarray(signal_segment, dtype=float).ravel()
-            if t.size < 256 or y.size != t.size:
-                return None
+            primary_t = np.asarray(t_segment, dtype=float).ravel()
+            primary_y = np.asarray(signal_segment, dtype=float).ravel()
+            fallback_t = (
+                np.asarray(fallback_time, dtype=float).ravel()
+                if fallback_time is not None
+                else None
+            )
+            fallback_y = (
+                np.asarray(fallback_signal, dtype=float).ravel()
+                if fallback_signal is not None
+                else None
+            )
+            min_samples = 256
+            t = primary_t
+            y = primary_y
+            if t.size < min_samples or y.size != t.size:
+                if (
+                    fallback_t is not None
+                    and fallback_y is not None
+                    and fallback_t.size == fallback_y.size
+                    and fallback_t.size >= min_samples
+                ):
+                    t = fallback_t
+                    y = fallback_y
+                else:
+                    min_samples = 128
+                    if t.size < min_samples or y.size != t.size:
+                        return None
             dt = float(np.median(np.diff(t)))
             if not (np.isfinite(dt) and dt > 0):
                 return None
@@ -5287,19 +5388,27 @@ class MainApp:
             nfft = min(nfft, n)
             if nfft < 128:
                 return None
-            window = np.hanning(nfft)
+            window, cg = _build_fft_window(window_type, nfft)
+            if window.size != nfft:
+                window = np.hanning(nfft)
+                cg = float(np.mean(window)) if np.any(window) else 1.0
+                if not np.isfinite(cg) or abs(cg) < 1e-12:
+                    cg = 1.0
             step = max(1, int(nfft * 0.25))
             if step >= nfft:
                 step = max(1, nfft // 4)
             spectra: List[np.ndarray] = []
             times: List[float] = []
             freq_axis = None
-            norm = 2.0 / float(nfft)
             for start in range(0, n - nfft + 1, step):
                 segment = y[start:start + nfft]
                 windowed = segment * window
                 fft_vals = np.fft.rfft(windowed)
-                mag_acc = norm * np.abs(fft_vals)
+                mag_acc = np.abs(fft_vals) / (nfft * cg)
+                if nfft % 2 == 0 and mag_acc.size >= 2:
+                    mag_acc[1:-1] *= 2.0
+                elif mag_acc.size >= 2:
+                    mag_acc[1:] *= 2.0
                 if freq_axis is None:
                     freq_axis = np.fft.rfftfreq(nfft, dt)
                 vel_spec = np.zeros_like(mag_acc)
@@ -6481,6 +6590,7 @@ class MainApp:
                 pre_decimate_to_fmax_hz=_fmax_pre,
                 env_bp_lo_hz=env_lo_val,
                 env_bp_hi_hz=env_hi_val,
+                fft_window=self.fft_window_type,
             )
             # Sustituir espectros por los del analizador
             xf = res['fft']['f_hz']
@@ -7029,6 +7139,10 @@ class MainApp:
             try:
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    try:
+                        full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
+                    except Exception:
+                        full_t_uniform, full_acc_uniform = None, None
                     runup_fig = self._generate_runup_3d_figure(
                         t_segment,
                         acc_segment,
@@ -7037,6 +7151,9 @@ class MainApp:
                         fmax_ui,
                         zoom_tuple,
                         self.is_dark_mode,
+                        full_t_uniform,
+                        full_acc_uniform,
+                        self.fft_window_type,
                     )
                     if runup_fig is not None:
                         runup_chart = MatplotlibChart(runup_fig, expand=True, isolated=True)
@@ -9074,6 +9191,21 @@ class MainApp:
         self._update_analysis()
 
 
+    def _on_fft_window_change(self, e=None):
+
+        try:
+            selected = getattr(getattr(e, "control", None), "value", None) if e else None
+        except Exception:
+            selected = None
+        resolved = _resolve_fft_window(selected if selected is not None else getattr(self, "fft_window_type", "hann"))
+        self.fft_window_type = resolved
+        try:
+            self.page.client_storage.set("fft_window_type", resolved)
+        except Exception:
+            pass
+        self._update_analysis()
+
+
     def _on_combine_signals_toggle(self, e=None):
 
         try:
@@ -9234,6 +9366,7 @@ class MainApp:
                         t_sig,
                         acc_sig,
                         pre_decimate_to_fmax_hz=pre_dec,
+                        fft_window=self.fft_window_type,
                     )
                     xf = res_sig.get('fft', {}).get('f_hz')
                     mag_vel_mm = res_sig.get('fft', {}).get('vel_spec_mm_s')
