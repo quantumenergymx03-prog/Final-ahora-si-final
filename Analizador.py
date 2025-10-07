@@ -2219,7 +2219,9 @@ class MainApp:
             axis_summaries.append(entry)
             rms_values.append(axis_rms)
         if rms_values:
-            global_rms = float(np.sqrt(np.sum(np.square(rms_values))))
+            # Calcular el RMS global como media cuadrática de los ejes evaluados
+            # evitando que ejecuciones previas influyan en el resultado.
+            global_rms = float(np.sqrt(np.mean(np.square(rms_values))))
             global_label, global_color = self._classify_severity_ms(global_rms / 1000.0)
             global_entry = {
                 "name": "Global",
@@ -2920,8 +2922,11 @@ class MainApp:
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
             elements.append(Spacer(1, 18))
             elements.append(Paragraph(f"Archivo analizado: {base_name}", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Periodo analizado: {start_t:.2f}s - {end_t:.2f}s", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Fecha de generacion: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Aplicacion: V-Analyzer {APP_VERSION}", styles['Normal']))
             elements.append(Spacer(1, 18))
 
@@ -2945,6 +2950,7 @@ class MainApp:
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
             _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
+            elements.append(Spacer(1, 16))
             elements.append(PageBreak())
 
             # Nota filtro visual (export): obtiene estado actual de la UI
@@ -2959,20 +2965,23 @@ class MainApp:
             _pdf_fft_filter_note = f"Filtro visual FFT: oculta < {_pdf_fc:.2f} Hz" if _pdf_hide_lf else "Filtro visual FFT: sin ocultar"
 
             elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            elements.append(Spacer(1, 8))
             exec_findings_all = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
             elements.append(Paragraph(f"Clasificacion ISO global: {severity_mm}", styles['Normal']))
+            elements.append(Spacer(1, 4))
             elements.append(Paragraph(f"RMS velocidad global: {rms_mm:.3f} mm/s", styles['Normal']))
             if axis_table_rows:
                 tbl_axes = Table(axis_table_rows, colWidths=[160, 120, 180])
                 _apply_table_style(tbl_axes)
                 elements.append(tbl_axes)
-                elements.append(Spacer(1, 8))
+                elements.append(Spacer(1, 10))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
+            elements.append(Spacer(1, 4))
             elements.append(Paragraph(_pdf_fft_filter_note, styles['Normal']))
-            elements.append(Spacer(1, 8))
+            elements.append(Spacer(1, 10))
             # Semáforo de severidad (actual + otros atenuados)
             try:
                 # Mapear label a índice
@@ -3039,19 +3048,28 @@ class MainApp:
             # Explicación y recomendaciones (unificadas con la app)
             exp_lines_pdf2 = self._build_explanations(res, exec_findings)
             elements.append(Paragraph("Explicacion y recomendaciones", styles['Heading2']))
-            for line in exp_lines_pdf2:
-                elements.append(Paragraph(f"- {line}", styles['Normal']))
+            elements.append(Spacer(1, 6))
+            if exp_lines_pdf2:
+                items = [
+                    ListItem(Paragraph(line, styles['Normal']), leftIndent=12, bulletColor=accent_color)
+                    for line in exp_lines_pdf2
+                ]
+                elements.append(ListFlowable(items, bulletType="bullet", start="•", spaceBefore=0, spaceAfter=6))
+            elements.append(Spacer(1, 12))
 
             
 
             elements.append(Paragraph("Reporte de Análisis de Vibraciones", title_style))
+            elements.append(Spacer(1, 8))
             elements.append(Paragraph(f"Archivo: {base_name}", styles['Normal']))
+            elements.append(Spacer(1, 4))
             elements.append(Paragraph(f"Periodo: {start_t:.2f}s - {end_t:.2f}s", styles['Normal']))
             elements.append(Spacer(1, 12))
 
             # Top picos (FFT)
             if top_peaks:
                 elements.append(Paragraph("Picos principales (FFT)", styles['Heading2']))
+                elements.append(Spacer(1, 6))
                 peaks_data = [[f"Frecuencia ({freq_unit})", "Amplitud (mm/s)", "Orden (X)"]]
                 for pf, pa, order in top_peaks:
                     peaks_data.append([
@@ -3087,15 +3105,18 @@ class MainApp:
             table_summary = Table(data_summary, colWidths=[200, 200])
             _apply_table_style(table_summary)
             elements.append(table_summary)
-            elements.append(Spacer(1, 12))
+            elements.append(Spacer(1, 16))
 
             elements.append(Image(img_time, width=400, height=150))
+            elements.append(Spacer(1, 10))
             elements.append(Image(img_fft, width=400, height=150))
             if img_env:
+                elements.append(Spacer(1, 10))
                 elements.append(Image(img_env, width=400, height=150))
                 if env_visible_peaks:
                     elements.append(Spacer(1, 8))
                     elements.append(Paragraph("Picos principales (envolvente)", styles['Heading2']))
+                    elements.append(Spacer(1, 4))
                     env_table_data = [[f"Frecuencia ({freq_unit})", "Amplitud (a.u.)", "SNR (dB)"]]
                     for f0, a0, snr in env_visible_peaks:
                         env_table_data.append([
@@ -7063,7 +7084,14 @@ class MainApp:
                 controls: List[ft.Control] = []
                 if not axis_summaries:
                     return controls
-                controls.append(ft.Text("Severidad por eje (RMS velocidad)", size=14, weight="bold"))
+                controls.append(
+                    ft.Text(
+                        "Severidad por eje (RMS velocidad)",
+                        size=14,
+                        weight="bold",
+                        text_align=ft.TextAlign.LEFT,
+                    )
+                )
                 for entry in axis_summaries:
                     try:
                         value_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
@@ -7072,7 +7100,8 @@ class MainApp:
                     color_hex = entry.get("color", "#7f8c8d")
                     controls.append(
                         ft.Container(
-                            content=ft.Row(
+                            expand=True,
+                            content=ft.Column(
                                 [
                                     ft.Row(
                                         [
@@ -7084,20 +7113,41 @@ class MainApp:
                                             ft.Text(
                                                 entry.get("name", "Eje"),
                                                 weight="bold" if entry.get("is_global") else None,
+                                                expand=True,
+                                                max_lines=1,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                                text_align=ft.TextAlign.LEFT,
                                             ),
                                         ],
-                                        spacing=6,
+                                        spacing=8,
                                         alignment="start",
                                     ),
-                                    ft.Text(value_txt, weight="bold"),
-                                    ft.Text(entry.get("iso_label", "N/D"), color=color_hex),
+                                    ft.Row(
+                                        [
+                                            ft.Text(
+                                                value_txt,
+                                                weight="bold",
+                                                text_align=ft.TextAlign.LEFT,
+                                            ),
+                                            ft.Text(
+                                                entry.get("iso_label", "N/D"),
+                                                color=color_hex,
+                                                expand=True,
+                                                max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                                text_align=ft.TextAlign.RIGHT,
+                                            ),
+                                        ],
+                                        spacing=8,
+                                        alignment="spaceBetween",
+                                        vertical_alignment="center",
+                                    ),
                                 ],
-                                alignment="spaceBetween",
-                                vertical_alignment="center",
+                                spacing=6,
                             ),
                             border=ft.border.all(1, color_hex),
                             border_radius=8,
-                            padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                            padding=ft.padding.symmetric(horizontal=12, vertical=10),
                         )
                     )
                 return controls
@@ -7120,7 +7170,12 @@ class MainApp:
                         ft.Row(
                             [
                                 ft.Icon(ft.Icons.ANALYTICS, color=self._accent_ui()),
-                                ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
+                                ft.Text(
+                                    "Resumen Ejecutivo",
+                                    size=18,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
                             ],
                             spacing=8,
                             alignment="start",
@@ -7138,16 +7193,33 @@ class MainApp:
                             border_radius=20,
                             padding=ft.padding.symmetric(horizontal=14, vertical=8),
                         ),
-                        ft.Text(f"RMS global (mm/s): {primary_rms_mm:.3f}", weight="bold"),
-                        ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                        ft.Text(
+                            f"RMS global (mm/s): {primary_rms_mm:.3f}",
+                            weight="bold",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"Frecuencia dominante: {dom_freq:.2f} Hz",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
                         *axis_summary_controls_exec,
-                        ft.Text("Hallazgos clave", weight="bold"),
+                        ft.Text(
+                            "Hallazgos clave",
+                            weight="bold",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
                         ft.Column(
                             [
                                 ft.Row(
                                     [
                                         ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
-                                        ft.Text(text),
+                                        ft.Text(
+                                            text,
+                                            expand=True,
+                                            text_align=ft.TextAlign.LEFT,
+                                            max_lines=4,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
                                     ],
                                     spacing=6,
                                     alignment="start",
@@ -7155,9 +7227,10 @@ class MainApp:
                                 for text in exec_findings
                             ],
                             spacing=4,
+                            tight=True,
                         ),
                     ],
-                    spacing=10,
+                    spacing=12,
                 ),
                 bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
                 border_radius=12,
@@ -7172,24 +7245,44 @@ class MainApp:
                         ft.Row(
                             [
                                 ft.Icon(ft.Icons.INSIGHTS, color=self._accent_ui()),
-                                ft.Text("Resumen del análisis", size=18, weight="bold"),
+                                ft.Text(
+                                    "Resumen del análisis",
+                                    size=18,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
                             ],
                             spacing=8,
                             alignment="start",
                         ),
-                        ft.Text(f"Periodo analizado: {start_t:.2f}s – {end_t:.2f}s"),
-                        ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                        ft.Text(f"RMS velocidad global: {primary_rms_mm:.3f} mm/s"),
+                        ft.Text(
+                            f"Periodo analizado: {start_t:.2f}s – {end_t:.2f}s",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"Frecuencia dominante: {dom_freq:.2f} Hz",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"RMS velocidad global: {primary_rms_mm:.3f} mm/s",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
                         *axis_summary_controls_main,
                         ft.Text(
                             "Crest factor (aceleración): "
-                            f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}"
+                            f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}",
+                            text_align=ft.TextAlign.LEFT,
                         ),
                         ft.Divider(),
                         ft.Row(
                             [
                                 ft.Icon(ft.Icons.FACT_CHECK, color=self._accent_ui()),
-                                ft.Text("Diagnóstico automático (baseline)", size=16, weight="bold"),
+                                ft.Text(
+                                    "Diagnóstico automático (baseline)",
+                                    size=16,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
                             ],
                             spacing=8,
                             alignment="start",
@@ -7199,7 +7292,13 @@ class MainApp:
                                 ft.Row(
                                     [
                                         ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
-                                        ft.Text(text),
+                                        ft.Text(
+                                            text,
+                                            expand=True,
+                                            text_align=ft.TextAlign.LEFT,
+                                            max_lines=4,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
                                     ],
                                     spacing=6,
                                     alignment="start",
@@ -7207,9 +7306,10 @@ class MainApp:
                                 for text in findings
                             ],
                             spacing=4,
+                            tight=True,
                         ),
                     ],
-                    spacing=10,
+                    spacing=12,
                 ),
                 bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
                 border_radius=12,
@@ -7254,7 +7354,12 @@ class MainApp:
                                 ft.Row(
                                     [
                                         ft.Icon(ft.Icons.LIGHTBULB, color=self._accent_ui()),
-                                        ft.Text("Explicación y revisión sugerida", size=16, weight="bold"),
+                                        ft.Text(
+                                            "Explicación y revisión sugerida",
+                                            size=16,
+                                            weight="bold",
+                                            text_align=ft.TextAlign.LEFT,
+                                        ),
                                     ],
                                     spacing=8,
                                     alignment="start",
@@ -7264,7 +7369,13 @@ class MainApp:
                                         ft.Row(
                                             [
                                                 ft.Icon(ft.Icons.CHECK_CIRCLE, color=self._accent_ui(), size=18),
-                                                ft.Text(line),
+                                                ft.Text(
+                                                    line,
+                                                    expand=True,
+                                                    text_align=ft.TextAlign.LEFT,
+                                                    max_lines=4,
+                                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                                ),
                                             ],
                                             spacing=6,
                                             alignment="start",
@@ -7272,15 +7383,16 @@ class MainApp:
                                         for line in exp_lines
                                     ],
                                     spacing=6,
+                                    tight=True,
                                 ),
                             ],
-                            spacing=10,
+                            spacing=12,
                         ),
                         bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
                         border_radius=12,
                         padding=ft.padding.all(16),
                     ),
-                    ft.Text(_fft_filter_note),
+                    ft.Text(_fft_filter_note, text_align=ft.TextAlign.LEFT),
                     chart
                 ]
                     + ([runup_chart] if runup_chart else [])
