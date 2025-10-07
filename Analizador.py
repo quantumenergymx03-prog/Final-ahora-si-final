@@ -2854,16 +2854,32 @@ class MainApp:
                         full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
                     except Exception:
                         full_t_uniform, full_acc_uniform = None, None
+                    base_t = full_t_uniform if full_t_uniform is not None and full_acc_uniform is not None else t_seg
+                    base_acc = full_acc_uniform if full_t_uniform is not None and full_acc_uniform is not None else acc_seg
+                    try:
+                        runup_mask, _, _ = self._resolve_runup_period(base_t)
+                    except Exception:
+                        runup_mask = None
+                    if (
+                        runup_mask is not None
+                        and runup_mask.size == base_t.size
+                        and np.count_nonzero(runup_mask) >= 2
+                    ):
+                        runup_t = base_t[runup_mask]
+                        runup_acc = base_acc[runup_mask]
+                    else:
+                        runup_t = base_t
+                        runup_acc = base_acc
                     runup_fig = self._generate_runup_3d_figure(
-                        t_seg,
-                        acc_seg,
+                        runup_t,
+                        runup_acc,
                         fc,
                         hide_lf,
                         fmax_ui,
                         zoom_tuple,
                         False,
-                        full_t_uniform,
-                        full_acc_uniform,
+                        base_t,
+                        base_acc,
                         self.fft_window_type,
                     )
                     if runup_fig is not None:
@@ -4837,6 +4853,20 @@ class MainApp:
 
         self.end_time_field = ft.TextField(label="Fin (s)", value="", width=100)
 
+        self.runup_start_field = ft.TextField(
+            label="Inicio arranque (s)",
+            value="",
+            width=140,
+            tooltip="Delimita el análisis específico para la cascada de arranque/paro.",
+        )
+
+        self.runup_end_field = ft.TextField(
+            label="Fin arranque (s)",
+            value="",
+            width=140,
+            tooltip="Delimita el análisis específico para la cascada de arranque/paro.",
+        )
+
         # Opciones visuales de frecuencias en FFT
         self.hide_lf_cb = ft.Checkbox(label="Ocultar bajas frecuencias", value=True)
         self.lf_cutoff_field = ft.TextField(label="Corte LF (Hz)", value="0.5", width=100)
@@ -4925,6 +4955,10 @@ class MainApp:
         self.db_ymin_field = ft.TextField(label="Y mín (dB)", value="", width=100)
         self.db_ymax_field = ft.TextField(label="Y máx (dB)", value="", width=100)
         # Recalcular al cambiar estas opciones
+        self.start_time_field.on_change = self._update_analysis
+        self.end_time_field.on_change = self._update_analysis
+        self.runup_start_field.on_change = self._update_analysis
+        self.runup_end_field.on_change = self._update_analysis
         self.hide_lf_cb.on_change = self._update_analysis
         self.lf_cutoff_field.on_change = self._update_analysis
         self.db_scale_cb.on_change = self._update_analysis
@@ -4972,7 +5006,9 @@ class MainApp:
         spectrum_settings = ft.Column(
             [
                 ft.Text("⏱️ Periodo de análisis", size=14, weight="bold"),
-                ft.Row([self.start_time_field, self.end_time_field], spacing=10),
+                ft.Row([self.start_time_field, self.end_time_field], spacing=10, wrap=True),
+                ft.Text("🚀 Periodo arranque/paro", size=14, weight="bold"),
+                ft.Row([self.runup_start_field, self.runup_end_field], spacing=10, wrap=True),
                 ft.Text("Opciones de espectro", size=14, weight="bold"),
                 ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.fft_window_dd, self.runup_3d_cb], spacing=10, wrap=True),
                 ft.Row([self.orbit_cb, self.orbit_x_dd, self.orbit_y_dd], spacing=10, wrap=True),
@@ -6020,6 +6056,48 @@ class MainApp:
             start_val = None
         try:
             raw_end = getattr(self.end_time_field, "value", None)
+            if raw_end not in (None, ""):
+                end_val = float(raw_end)
+        except Exception:
+            end_val = None
+        start_t = start_val if start_val is not None else full_start
+        end_t = end_val if end_val is not None else full_end
+        start_t = min(max(start_t, full_start), full_end)
+        end_t = min(max(end_t, full_start), full_end)
+        if start_val is not None and end_val is not None and end_t <= start_t:
+            start_t, end_t = end_t, start_t
+        if end_t <= start_t:
+            start_t, end_t = full_start, full_end
+        mask = valid & (t_arr >= start_t) & (t_arr <= end_t)
+        if np.count_nonzero(mask) < 2:
+            mask = valid.copy()
+            start_t, end_t = full_start, full_end
+        return mask.astype(bool), float(start_t), float(end_t)
+
+    def _resolve_runup_period(
+        self, time_vector: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
+        """Delimita el periodo exclusivo para la cascada de arranque/paro."""
+
+        t_arr = np.asarray(time_vector, dtype=float).ravel()
+        if t_arr.size == 0:
+            return np.zeros(0, dtype=bool), 0.0, 0.0
+        valid = np.isfinite(t_arr)
+        if not np.any(valid):
+            return np.zeros_like(t_arr, dtype=bool), 0.0, 0.0
+        t_valid = t_arr[valid]
+        full_start = float(np.nanmin(t_valid))
+        full_end = float(np.nanmax(t_valid))
+        start_val: Optional[float] = None
+        end_val: Optional[float] = None
+        try:
+            raw_start = getattr(self.runup_start_field, "value", None)
+            if raw_start not in (None, ""):
+                start_val = float(raw_start)
+        except Exception:
+            start_val = None
+        try:
+            raw_end = getattr(self.runup_end_field, "value", None)
             if raw_end not in (None, ""):
                 end_val = float(raw_end)
         except Exception:
@@ -7143,16 +7221,32 @@ class MainApp:
                         full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
                     except Exception:
                         full_t_uniform, full_acc_uniform = None, None
+                    base_t = full_t_uniform if full_t_uniform is not None and full_acc_uniform is not None else t_segment
+                    base_acc = full_acc_uniform if full_t_uniform is not None and full_acc_uniform is not None else acc_segment
+                    try:
+                        runup_mask, _, _ = self._resolve_runup_period(base_t)
+                    except Exception:
+                        runup_mask = None
+                    if (
+                        runup_mask is not None
+                        and runup_mask.size == base_t.size
+                        and np.count_nonzero(runup_mask) >= 2
+                    ):
+                        runup_t = base_t[runup_mask]
+                        runup_acc = base_acc[runup_mask]
+                    else:
+                        runup_t = base_t
+                        runup_acc = base_acc
                     runup_fig = self._generate_runup_3d_figure(
-                        t_segment,
-                        acc_segment,
+                        runup_t,
+                        runup_acc,
                         fc,
                         hide_lf,
                         fmax_ui,
                         zoom_tuple,
                         self.is_dark_mode,
-                        full_t_uniform,
-                        full_acc_uniform,
+                        base_t,
+                        base_acc,
                         self.fft_window_type,
                     )
                     if runup_fig is not None:
@@ -9008,6 +9102,10 @@ class MainApp:
         self.file_data_storage[file_path] = df
 
         self.current_df = df
+        self._last_axis_severity = []
+        self._last_primary_severity = None
+        self._fft_full_range = None
+        self._fft_zoom_range = None
 
         try:
             self.input_signal_unit = "acc_ms2"
@@ -9025,6 +9123,16 @@ class MainApp:
         # Cambiar automáticamente a vista de análisis
 
         self._select_menu("analysis", force_rebuild=True)
+
+        try:
+            if getattr(self, "runup_start_field", None):
+                self.runup_start_field.value = ""
+                self.runup_start_field.update()
+            if getattr(self, "runup_end_field", None):
+                self.runup_end_field.value = ""
+                self.runup_end_field.update()
+        except Exception:
+            pass
 
 
 
