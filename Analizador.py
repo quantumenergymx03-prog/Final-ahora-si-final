@@ -1046,6 +1046,7 @@ class MainApp:
         self._last_axis_columns: Dict[str, str] = {}
         self._last_axis_rms: Dict[str, float] = {}
         self._normalized_axis_columns: Dict[str, str] = {}
+        self._axis_unit_scales: Dict[str, float] = {}
         self.default_time_col: Optional[str] = None
         self.default_signal_cols: List[str] = []
 
@@ -4907,51 +4908,67 @@ class MainApp:
         f_lo: float = 10.0,
         f_hi: float = 1000.0,
     ) -> float:
-        """Calcula RMS de velocidad [mm/s] dentro de una banda (ISO 10816)."""
+        """Calcula RMS de velocidad [mm/s] dentro de la banda 10–1000 Hz (ISO 10816)."""
 
         if acc_ms2 is None:
             return 0.0
 
-        t = np.asarray(time_s, dtype=float)
-        y = np.asarray(acc_ms2, dtype=float)
+        t = np.asarray(time_s, dtype=float).ravel()
+        y = np.asarray(acc_ms2, dtype=float).ravel()
 
         if t.size < 2 or y.size < 2:
             return 0.0
 
-        n = min(t.size, y.size)
-        if n < 2:
+        finite_mask = np.isfinite(t) & np.isfinite(y)
+        if finite_mask.sum() < 2:
             return 0.0
 
-        t = t[:n]
-        y = y[:n]
+        t = t[finite_mask]
+        y = y[finite_mask]
 
-        dt = float(np.mean(np.diff(t))) if n > 1 else 0.0
+        if t.size < 2:
+            return 0.0
+
+        order = np.argsort(t)
+        t = t[order]
+        y = y[order]
+
+        dt_values = np.diff(t)
+        dt_values = dt_values[np.isfinite(dt_values) & (dt_values > 0)]
+        if dt_values.size == 0:
+            return 0.0
+
+        dt = float(np.median(dt_values))
         if not np.isfinite(dt) or dt <= 0.0:
             return 0.0
 
+        y = np.nan_to_num(y - np.nanmean(y), nan=0.0, posinf=0.0, neginf=0.0)
+
+        n = y.size
         xf = np.fft.rfftfreq(n, dt)
-        if xf.size == 0:
+        if xf.size < 2:
             return 0.0
 
-        y_fft = np.fft.rfft(y)
-        v_fft = np.zeros_like(y_fft, dtype=complex)
-        pos = xf > 0
-        if np.any(pos):
-            v_fft[pos] = y_fft[pos] / (1j * 2.0 * np.pi * xf[pos])
+        Y = np.fft.rfft(y)
+        V = np.zeros_like(Y, dtype=complex)
+        V[1:] = Y[1:] / (1j * 2.0 * np.pi * xf[1:])
+        V[0] = 0.0
 
         band_mask = (xf >= float(f_lo)) & (xf <= float(f_hi))
         if not np.any(band_mask):
             return 0.0
 
-        v_band = np.where(band_mask, v_fft, 0.0)
-        v_t = np.fft.irfft(v_band, n=n)
+        V_band = np.where(band_mask, V, 0.0)
+        v_t = np.fft.irfft(V_band, n=n)
+
         if v_t.size == 0:
             return 0.0
 
-        rms_vel_mm = 1000.0 * float(np.sqrt(np.mean(np.square(v_t))))
+        rms_vel_mm = 1000.0 * np.sqrt(np.mean(v_t**2))
         if not np.isfinite(rms_vel_mm):
             return 0.0
-        return rms_vel_mm
+
+        return float(rms_vel_mm)
 
     def _calculate_rms_axes(
         self,
@@ -5844,6 +5861,23 @@ class MainApp:
             axis_parts: List[str] = []
             worst_axis: Optional[str] = None
             worst_rank = -1
+            conversions: List[str] = []
+            axis_columns = getattr(self, "_last_axis_columns", {}) or {}
+            axis_scales = getattr(self, "_axis_unit_scales", {}) or {}
+            for axis_label, column_name in axis_columns.items():
+                scale = axis_scales.get(column_name)
+                if scale is None or not np.isfinite(scale):
+                    continue
+                if np.isclose(scale, 1.0):
+                    continue
+                if scale > 1.0:
+                    conversions.append(
+                        f"{axis_label}: valores escalados ×{scale:.3f} para llevar la señal a m/s²."
+                    )
+                else:
+                    conversions.append(
+                        f"{axis_label}: valores escalados ×{scale:.6f} para llevar la señal a m/s²."
+                    )
             for axis_label in ("X", "Y", "Z", "Global"):
                 if axis_label not in axis_rms:
                     continue
@@ -5862,6 +5896,10 @@ class MainApp:
             if axis_parts:
                 lines.append(
                     "RMS por eje (10–1000 Hz): " + " | ".join(axis_parts)
+                )
+            if conversions:
+                lines.append(
+                    "Normalización de unidades aplicada: " + "; ".join(conversions)
                 )
             if worst_axis:
                 if worst_axis == "Global" and worst_rank >= 0:
@@ -8106,6 +8144,47 @@ class MainApp:
     ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, str]]:
         """Normaliza columnas de tiempo/ejes para datasets industriales o de laboratorio."""
 
+        def _coerce_axis_units(series: pd.Series, column_name: str) -> Tuple[pd.Series, float]:
+            """Convierte a m/s² si la columna está en g, mg, cm/s² o mm/s²."""
+
+            numeric = pd.to_numeric(series, errors="coerce")
+            lower = str(column_name).strip().lower()
+            tokens = [tok for tok in re.split(r"[^a-z0-9]+", lower) if tok]
+            token_set = set(tokens)
+            normalized = re.sub(r"[^a-z0-9/^]", "", lower)
+
+            has_ms2 = (
+                "m/s2" in normalized
+                or "m/s^2" in lower
+                or "mps2" in normalized
+                or "mpss" in normalized
+                or "ms-2" in lower
+                or "m·s-2" in lower
+                or "m•s-2" in lower
+                or "ms2" in token_set
+            )
+            has_mm = "mm/s2" in normalized or "mmps2" in normalized or "mms2" in token_set
+            has_cm = "cm/s2" in normalized or "cmps2" in normalized or "cms2" in token_set or "gal" in token_set
+            has_mg = "mg" in token_set or "milli-g" in lower or "millig" in lower
+            has_gravity = bool(token_set & {"g", "grms", "g_rms", "rmsg"}) or "(g)" in lower or bool(re.search(r"\bg\b", lower))
+
+            scale = 1.0
+            if has_ms2:
+                scale = 1.0
+            elif has_mm:
+                scale = 1e-3
+            elif has_cm:
+                scale = 1e-2
+            elif has_mg:
+                scale = 9.80665e-3
+            elif has_gravity and not token_set & {"avg", "avgx", "avgy", "avgz"}:
+                scale = 9.80665
+
+            converted = numeric.astype(float) * scale
+            return converted, scale
+
+        self._axis_unit_scales = {}
+
         if df is None or getattr(df, "empty", True):
             return df, None, {}
 
@@ -8262,8 +8341,10 @@ class MainApp:
                 source_col,
                 pd.to_numeric(normalized_df[source_col], errors="coerce"),
             )
-            normalized_df[target_col] = source_series.astype(float)
+            converted_series, scale = _coerce_axis_units(source_series, source_col)
+            normalized_df[target_col] = converted_series.astype(float)
             normalized_axes[axis_label] = target_col
+            self._axis_unit_scales[target_col] = scale
 
         for axis_label in ("X", "Y", "Z"):
             col_name = f"acc{axis_label}"
@@ -8379,6 +8460,16 @@ class MainApp:
             if normalized_axes:
                 formatted_axes = ", ".join(f"{axis}: {col}" for axis, col in normalized_axes.items())
                 self._log(f"Ejes detectados: {formatted_axes}")
+                conversions = []
+                for axis_label, column_name in normalized_axes.items():
+                    scale = self._axis_unit_scales.get(column_name)
+                    if scale is None or not np.isfinite(scale) or np.isclose(scale, 1.0):
+                        continue
+                    conversions.append(f"{axis_label} ×{scale:.3f}")
+                if conversions:
+                    self._log(
+                        "Ajuste de unidades aplicado (→ m/s²): " + ", ".join(conversions)
+                    )
 
 
 
