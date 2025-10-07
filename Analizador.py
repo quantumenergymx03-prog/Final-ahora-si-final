@@ -1080,6 +1080,8 @@ class MainApp:
 
         self.file_data_storage = {}  # Almacenar datos de archivos
         self.signal_unit_map: Dict[str, str] = {}
+        self._last_axis_severity: List[Dict[str, Any]] = []
+        self._last_primary_severity: Optional[Dict[str, Any]] = None
         self._fft_zoom_range: Optional[Tuple[float, float]] = None
         self._fft_full_range: Optional[Tuple[float, float]] = None
         self._fft_zoom_syncing = False
@@ -2039,6 +2041,163 @@ class MainApp:
         except Exception:
             return None
 
+    def _axis_letter_from_name(self, column: Any) -> Optional[str]:
+        name = str(column)
+        cl = name.lower()
+        if any(token in cl for token in ["ch1", "channel1", "axis x", " eje x"]):
+            return "X"
+        if any(token in cl for token in ["ch2", "channel2", "axis y", " eje y"]):
+            return "Y"
+        if any(token in cl for token in ["ch3", "channel3", "axis z", " eje z"]):
+            return "Z"
+        if ("acc" in cl) or ("acel" in cl):
+            if "x" in cl and "y" not in cl and "z" not in cl:
+                return "X"
+            if "y" in cl and "x" not in cl and "z" not in cl:
+                return "Y"
+            if "z" in cl and "x" not in cl and "y" not in cl:
+                return "Z"
+        if re.search(r"[_\-\s]x(?![a-z0-9])", cl) or cl.endswith("x"):
+            return "X"
+        if re.search(r"[_\-\s]y(?![a-z0-9])", cl) or cl.endswith("y"):
+            return "Y"
+        if re.search(r"[_\-\s]z(?![a-z0-9])", cl) or cl.endswith("z"):
+            return "Z"
+        return None
+
+    def _axis_display_name(self, column: Any) -> str:
+        letter = self._axis_letter_from_name(column)
+        return f"Eje {letter}" if letter else str(column)
+
+    def _get_axis_columns(self, time_col: str) -> List[str]:
+        if self.current_df is None:
+            return []
+        axis_cols: List[str] = []
+        for col in self.current_df.columns:
+            if str(col) == str(time_col):
+                continue
+            unit = (self.signal_unit_map or {}).get(col)
+            if unit == "acc_ms2":
+                axis_cols.append(col)
+                continue
+            name = str(col).lower()
+            if ("acc" in name) or ("acel" in name) or self._axis_letter_from_name(col):
+                axis_cols.append(col)
+        return axis_cols
+
+    def _compute_axis_severity(
+        self,
+        time_col: str,
+        mask: np.ndarray,
+        rpm_val: Optional[float],
+        line_val: Optional[float],
+        teeth_val: Optional[int],
+        pre_decimate_hz: Optional[float],
+        bpfo_val: Optional[float],
+        bpfi_val: Optional[float],
+        bsf_val: Optional[float],
+        ftf_val: Optional[float],
+        env_lo: Optional[float],
+        env_hi: Optional[float],
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if self.current_df is None:
+            self._last_axis_severity = []
+            self._last_primary_severity = None
+            return [], None
+        try:
+            t_full = pd.to_numeric(self.current_df[time_col], errors="coerce").to_numpy(dtype=float)
+        except Exception:
+            self._last_axis_severity = []
+            self._last_primary_severity = None
+            return [], None
+        if mask.size != t_full.size:
+            mask = mask[: t_full.size]
+        t_segment_raw = t_full[mask]
+        axis_cols = [col for col in self._get_axis_columns(time_col) if col in self.current_df.columns]
+        axis_summaries: List[Dict[str, Any]] = []
+        rms_values: List[float] = []
+        for col in axis_cols:
+            try:
+                series = pd.to_numeric(self.current_df[col], errors="coerce")
+                values = series.to_numpy(dtype=float)
+            except Exception:
+                values = np.asarray(self.current_df[col], dtype=float)
+            if values.size != mask.size:
+                if values.size:
+                    values = values[: mask.size]
+                else:
+                    continue
+            seg_raw = values[mask]
+            try:
+                t_axis, acc_axis, _, _ = self._prepare_segment_for_analysis(t_segment_raw, seg_raw, col)
+            except Exception:
+                t_axis, acc_axis = np.asarray([]), np.asarray([])
+            if acc_axis.size < 2 or t_axis.size < 2:
+                entry = {
+                    "name": self._axis_display_name(col),
+                    "column": col,
+                    "rms_mm_s": 0.0,
+                    "iso_label": "Sin datos",
+                    "emoji_label": "Sin datos",
+                    "color": "#7f8c8d",
+                    "is_global": False,
+                }
+                axis_summaries.append(entry)
+                continue
+            try:
+                res_axis = analyze_vibration(
+                    t_axis,
+                    acc_axis,
+                    rpm=rpm_val,
+                    line_freq_hz=line_val,
+                    bpfo_hz=bpfo_val,
+                    bpfi_hz=bpfi_val,
+                    bsf_hz=bsf_val,
+                    ftf_hz=ftf_val,
+                    gear_teeth=teeth_val,
+                    pre_decimate_to_fmax_hz=pre_decimate_hz,
+                    env_bp_lo_hz=env_lo,
+                    env_bp_hi_hz=env_hi,
+                )
+                axis_rms = float(res_axis.get("severity", {}).get("rms_mm_s", 0.0))
+                iso_label = res_axis.get("severity", {}).get("label", "N/D")
+                color = res_axis.get("severity", {}).get("color", "#7f8c8d")
+            except Exception:
+                axis_rms = 0.0
+                iso_label = "N/D"
+                color = "#7f8c8d"
+            emoji_label = self._classify_severity(axis_rms)
+            entry = {
+                "name": self._axis_display_name(col),
+                "column": col,
+                "rms_mm_s": axis_rms,
+                "iso_label": iso_label,
+                "emoji_label": emoji_label,
+                "color": color,
+                "is_global": False,
+            }
+            axis_summaries.append(entry)
+            rms_values.append(axis_rms)
+        if rms_values:
+            global_rms = float(np.sqrt(np.sum(np.square(rms_values))))
+            global_label, global_color = self._classify_severity_ms(global_rms / 1000.0)
+            global_entry = {
+                "name": "Global",
+                "column": "global",
+                "rms_mm_s": global_rms,
+                "iso_label": global_label,
+                "emoji_label": self._classify_severity(global_rms),
+                "color": global_color,
+                "is_global": True,
+            }
+            axis_summaries.insert(0, global_entry)
+        primary = None
+        if axis_summaries:
+            primary = next((entry for entry in axis_summaries if entry.get("is_global")), axis_summaries[0])
+        self._last_axis_severity = axis_summaries
+        self._last_primary_severity = primary
+        return axis_summaries, primary
+
     # Helpers de lectura segura de campos
     def _fldf(self, fld):
         try:
@@ -2243,30 +2402,69 @@ class MainApp:
                 _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
             except Exception:
                 _fmax_pre = None
+            bpfo_val = self._fldf(getattr(self, 'bpfo_field', None))
+            bpfi_val = self._fldf(getattr(self, 'bpfi_field', None))
+            bsf_val = self._fldf(getattr(self, 'bsf_field', None))
+            ftf_val = self._fldf(getattr(self, 'ftf_field', None))
+            env_lo_val = self._fldf(getattr(self, 'env_bp_lo_field', None))
+            env_hi_val = self._fldf(getattr(self, 'env_bp_hi_field', None))
             res = analyze_vibration(
                 t_seg,
                 acc_seg,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
+                bpfo_hz=bpfo_val,
+                bpfi_hz=bpfi_val,
+                bsf_hz=bsf_val,
+                ftf_hz=ftf_val,
                 gear_teeth=teeth_val,
                 pre_decimate_to_fmax_hz=_fmax_pre,
-                env_bp_lo_hz=self._fldf(getattr(self, 'env_bp_lo_field', None)),
-                env_bp_hi_hz=self._fldf(getattr(self, 'env_bp_hi_field', None)),
+                env_bp_lo_hz=env_lo_val,
+                env_bp_hi_hz=env_hi_val,
             )
             xf = res['fft']['f_hz']
             mag_vel_mm = res['fft']['vel_spec_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_mm = res['severity']['label']
+            selected_rms_mm = res['severity']['rms_mm_s']
+            selected_label = res['severity']['label']
+            selected_color = res['severity']['color']
+            axis_summaries_pdf, primary_entry_pdf = self._compute_axis_severity(
+                time_col,
+                mask,
+                rpm_val,
+                line_val,
+                teeth_val,
+                _fmax_pre,
+                bpfo_val,
+                bpfi_val,
+                bsf_val,
+                ftf_val,
+                env_lo_val,
+                env_hi_val,
+            )
+            if primary_entry_pdf is None:
+                primary_entry_pdf = {
+                    "name": self._axis_display_name(fft_signal_col),
+                    "column": fft_signal_col,
+                    "rms_mm_s": selected_rms_mm,
+                    "iso_label": selected_label,
+                    "emoji_label": self._classify_severity(selected_rms_mm),
+                    "color": selected_color,
+                    "is_global": False,
+                }
+                self._last_primary_severity = primary_entry_pdf
+                if not getattr(self, "_last_axis_severity", []):
+                    self._last_axis_severity = [primary_entry_pdf]
+            else:
+                self._last_primary_severity = primary_entry_pdf
+            primary_rms_mm_pdf = float(primary_entry_pdf.get("rms_mm_s", selected_rms_mm))
+            primary_label_pdf = primary_entry_pdf.get("iso_label", selected_label)
+            primary_color_pdf = primary_entry_pdf.get("color", selected_color)
             features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
                 "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                 "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
             }
             try:
-                features_full["rms_vel_spec"] = float(rms_mm)
+                features_full["rms_vel_spec"] = float(primary_rms_mm_pdf)
             except Exception:
                 pass
             self._last_xf = xf
@@ -2274,58 +2472,6 @@ class MainApp:
             self._last_tseg = t_seg
             self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', []) if xf is not None else ["Sin espectro valido para diagnostico."]
-
-            # Recalcular con analizador unificado (RMS de velocidad correcto)
-            try:
-                rpm_val = None
-                if getattr(self, "rpm_hint_field", None) and getattr(self.rpm_hint_field, "value", ""):
-                    rpm_val = float(self.rpm_hint_field.value)
-            except Exception:
-                rpm_val = None
-            try:
-                line_val = float(self.line_freq_dd.value) if getattr(self, "line_freq_dd", None) and getattr(self.line_freq_dd, "value", "") else None
-            except Exception:
-                line_val = None
-            try:
-                teeth_val = int(self.gear_teeth_field.value) if getattr(self, "gear_teeth_field", None) and getattr(self.gear_teeth_field, "value", "") else None
-            except Exception:
-                teeth_val = None
-            # usando self._fldf para leer campos numéricos opcionales
-            try:
-                _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
-            except Exception:
-                _fmax_pre = None
-            res = analyze_vibration(
-                t_seg,
-                acc_seg,
-                rpm=rpm_val,
-                line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
-                gear_teeth=teeth_val,
-                pre_decimate_to_fmax_hz=_fmax_pre,
-                env_bp_lo_hz=self._fldf(getattr(self, 'env_bp_lo_field', None)),
-                env_bp_hi_hz=self._fldf(getattr(self, 'env_bp_hi_field', None)),
-            )
-            xf = res['fft']['f_hz']
-            mag_vel_mm = res['fft']['vel_spec_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_mm = res['severity']['label']
-            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
-                "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
-                "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
-            }
-            try:
-                features_full["rms_vel_spec"] = float(rms_mm)
-            except Exception:
-                pass
-            self._last_xf = xf
-            self._last_spec = mag_vel_mm
-            self._last_tseg = t_seg
-            self._last_accseg = acc_seg
-            findings_pdf = res.get('diagnosis', [])
             severity_entry_pdf = res.get('diagnosis_summary')
             findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
             if not findings_core_pdf and findings_pdf:
@@ -2333,6 +2479,21 @@ class MainApp:
             charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
             if not charlotte_catalog_pdf:
                 charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
+            severity_mm = self._classify_severity(primary_rms_mm_pdf)
+            rms_mm = primary_rms_mm_pdf
+            axis_table_rows: List[List[str]] = []
+            if axis_summaries_pdf:
+                axis_table_rows.append(["Canal", "RMS (mm/s)", "Clasificación ISO"])
+                for entry in axis_summaries_pdf:
+                    try:
+                        rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f}"
+                    except Exception:
+                        rms_txt = "N/D"
+                    axis_table_rows.append([
+                        entry.get("name", "Eje"),
+                        rms_txt,
+                        entry.get("iso_label", "N/D"),
+                    ])
 
             try:
                 unit_mode = getattr(self.time_unit_dd, 'value', 'vel_mm')
@@ -2713,10 +2874,21 @@ class MainApp:
 
             cover_summary = [
                 ["Indicador", "Valor"],
-                ["RMS velocidad", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
+                ["RMS velocidad global", f"{primary_rms_mm_pdf:.3f} mm/s"],
+                ["Clasificacion ISO global", primary_label_pdf],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
+            for entry in axis_summaries_pdf:
+                if entry.get("is_global"):
+                    continue
+                try:
+                    axis_rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                except Exception:
+                    axis_rms_txt = "N/D"
+                cover_summary.append([
+                    f"RMS {entry.get('name', 'Eje')}",
+                    f"{axis_rms_txt} → {entry.get('iso_label', 'N/D')}"
+                ])
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
             _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
@@ -2738,8 +2910,13 @@ class MainApp:
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
-            elements.append(Paragraph(f"Clasificacion ISO: {severity_mm}", styles['Normal']))
-            elements.append(Paragraph(f"RMS velocidad: {rms_mm:.3f} mm/s", styles['Normal']))
+            elements.append(Paragraph(f"Clasificacion ISO global: {severity_mm}", styles['Normal']))
+            elements.append(Paragraph(f"RMS velocidad global: {rms_mm:.3f} mm/s", styles['Normal']))
+            if axis_table_rows:
+                tbl_axes = Table(axis_table_rows, colWidths=[160, 120, 180])
+                _apply_table_style(tbl_axes)
+                elements.append(tbl_axes)
+                elements.append(Spacer(1, 8))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
             elements.append(Paragraph(_pdf_fft_filter_note, styles['Normal']))
             elements.append(Spacer(1, 8))
@@ -2832,10 +3009,21 @@ class MainApp:
 
             data_summary = [
                 ["Metrica", "Valor"],
-                ["RMS (velocidad)", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
+                ["RMS velocidad global", f"{rms_mm:.3f} mm/s"],
+                ["Clasificacion ISO global", primary_label_pdf],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
+            for entry in axis_summaries_pdf:
+                if entry.get("is_global"):
+                    continue
+                try:
+                    axis_rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                except Exception:
+                    axis_rms_txt = "N/D"
+                data_summary.append([
+                    f"RMS {entry.get('name', 'Eje')}",
+                    f"{axis_rms_txt} → {entry.get('iso_label', 'N/D')}"
+                ])
             table_summary = Table(data_summary, colWidths=[200, 200])
             _apply_table_style(table_summary)
             elements.append(table_summary)
@@ -6062,17 +6250,25 @@ class MainApp:
                 _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
             except Exception:
                 _fmax_pre = None
+            bpfo_val = self._fldf(getattr(self, 'bpfo_field', None))
+            bpfi_val = self._fldf(getattr(self, 'bpfi_field', None))
+            bsf_val = self._fldf(getattr(self, 'bsf_field', None))
+            ftf_val = self._fldf(getattr(self, 'ftf_field', None))
+            env_lo_val = self._fldf(getattr(self, 'env_bp_lo_field', None))
+            env_hi_val = self._fldf(getattr(self, 'env_bp_hi_field', None))
             res = analyze_vibration(
                 t_segment,
                 acc_segment,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
+                bpfo_hz=bpfo_val,
+                bpfi_hz=bpfi_val,
+                bsf_hz=bsf_val,
+                ftf_hz=ftf_val,
                 gear_teeth=teeth_val,
                 pre_decimate_to_fmax_hz=_fmax_pre,
+                env_bp_lo_hz=env_lo_val,
+                env_bp_hi_hz=env_hi_val,
             )
             # Sustituir espectros por los del analizador
             xf = res['fft']['f_hz']
@@ -6110,9 +6306,41 @@ class MainApp:
                 self._update_fft_zoom_controls(None, None)
             dom_freq = res['fft']['dom_freq_hz']
             dom_amp = res['fft']['dom_amp_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_label_ms = res['severity']['label']
-            severity_color_ms = res['severity']['color']
+            selected_rms_mm = res['severity']['rms_mm_s']
+            selected_label = res['severity']['label']
+            selected_color = res['severity']['color']
+            axis_summaries, primary_entry = self._compute_axis_severity(
+                time_col,
+                mask,
+                rpm_val,
+                line_val,
+                teeth_val,
+                _fmax_pre,
+                bpfo_val,
+                bpfi_val,
+                bsf_val,
+                ftf_val,
+                env_lo_val,
+                env_hi_val,
+            )
+            if primary_entry is None:
+                primary_entry = {
+                    "name": self._axis_display_name(fft_signal_col),
+                    "column": fft_signal_col,
+                    "rms_mm_s": selected_rms_mm,
+                    "iso_label": selected_label,
+                    "emoji_label": self._classify_severity(selected_rms_mm),
+                    "color": selected_color,
+                    "is_global": False,
+                }
+                self._last_primary_severity = primary_entry
+                if not getattr(self, "_last_axis_severity", []):
+                    self._last_axis_severity = [primary_entry]
+            else:
+                self._last_primary_severity = primary_entry
+            primary_rms_mm = float(primary_entry.get("rms_mm_s", selected_rms_mm))
+            primary_label = primary_entry.get("iso_label", selected_label)
+            primary_color = primary_entry.get("color", selected_color)
             raw_findings = res.get('diagnosis', [])
             findings_core = list(res.get('diagnosis_findings', []) or [])
             if not findings_core and raw_findings:
@@ -6137,7 +6365,7 @@ class MainApp:
             except Exception:
                 frac_low = frac_mid = frac_high = 0.0
             try:
-                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s → {severity_label_ms}.")
+                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {primary_rms_mm:.3f} mm/s → {primary_label}.")
             except Exception:
                 pass
             def _has(txt: str) -> bool:
@@ -6585,9 +6813,43 @@ class MainApp:
                     aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
                     plt.close(aux_fig)
 
+            def _build_axis_controls() -> List[ft.Control]:
+                controls: List[ft.Control] = []
+                if not axis_summaries:
+                    return controls
+                controls.append(ft.Text("Severidad por eje (RMS velocidad)", size=14, weight="bold"))
+                for entry in axis_summaries:
+                    try:
+                        value_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                    except Exception:
+                        value_txt = "N/D"
+                    controls.append(
+                        ft.Row(
+                            [
+                                ft.Text(
+                                    entry.get("name", "Eje"),
+                                    weight="bold" if entry.get("is_global") else None,
+                                ),
+                                ft.Text(value_txt),
+                                ft.Container(
+                                    width=12,
+                                    height=12,
+                                    bgcolor=entry.get("color", "#7f8c8d"),
+                                    border_radius=6,
+                                ),
+                                ft.Text(entry.get("iso_label", "N/D")),
+                            ],
+                            alignment="spaceBetween",
+                        )
+                    )
+                return controls
+
+            axis_summary_controls_exec = _build_axis_controls()
+            axis_summary_controls_main = _build_axis_controls()
+
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
-                sev_label, sev_color = severity_label_ms, severity_color_ms
+                sev_label, sev_color = primary_label, primary_color
             except Exception:
                 sev_label, sev_color = "N/D", "#7f8c8d"
             exec_findings_all = list(findings)
@@ -6601,7 +6863,8 @@ class MainApp:
                         ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
                         ft.Text(f"Clasificación ISO: {sev_label}")
                     ]),
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                    ft.Text(f"RMS velocidad: {primary_rms_mm:.3f} mm/s"),
+                    *axis_summary_controls_exec,
                     ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
                     ft.Text("Diagnóstico:"),
                     *[ft.Text(f"- {it}") for it in exec_findings],
@@ -6623,7 +6886,9 @@ class MainApp:
 
                     ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
 
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                    ft.Text(f"RMS velocidad: {primary_rms_mm:.3f} mm/s"),
+
+                    *axis_summary_controls_main,
 
                     ft.Text(
                         f"Crest factor (aceleración): "
