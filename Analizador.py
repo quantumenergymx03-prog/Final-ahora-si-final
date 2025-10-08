@@ -7,6 +7,8 @@ from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
 import matplotlib
+import re
+import warnings
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -16,7 +18,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Set
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
 from reportlab.lib.pagesizes import A4
@@ -1041,6 +1043,12 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        self._last_axis_columns: Dict[str, str] = {}
+        self._last_axis_rms: Dict[str, float] = {}
+        self._normalized_axis_columns: Dict[str, str] = {}
+        self._axis_unit_scales: Dict[str, float] = {}
+        self.default_time_col: Optional[str] = None
+        self.default_signal_cols: List[str] = []
 
 
 
@@ -2173,6 +2181,43 @@ class MainApp:
             mask = (t >= start_t) & (t <= end_t)
             t_seg, sig_seg = t[mask], signal[mask]
 
+            axis_columns = self._get_axis_columns()
+            axis_segments = self._get_axis_data(mask, axis_columns)
+            axis_rms = None
+            if axis_segments:
+                axis_rms = self._calculate_rms_axes(
+                    t_seg,
+                    axis_segments.get("X"),
+                    axis_segments.get("Y"),
+                    axis_segments.get("Z"),
+                )
+            elif getattr(self, "uploaded_files", None):
+                try:
+                    raw_df, _, _ = self._load_vibration_csv(self.uploaded_files[0])
+                    time_s = raw_df.get("time")
+                    if time_s is not None:
+                        time_vals = pd.to_numeric(time_s, errors="coerce").to_numpy(dtype=float)
+                        acc_x = (
+                            pd.to_numeric(raw_df.get("accX"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accX" in raw_df.columns
+                            else None
+                        )
+                        acc_y = (
+                            pd.to_numeric(raw_df.get("accY"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accY" in raw_df.columns
+                            else None
+                        )
+                        acc_z = (
+                            pd.to_numeric(raw_df.get("accZ"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accZ" in raw_df.columns
+                            else None
+                        )
+                        axis_rms = self._calculate_rms_axes(time_vals, acc_x, acc_y, acc_z)
+                except Exception as exc:
+                    print(f"Error calculando RMS por ejes (PDF): {exc}")
+            self._last_axis_columns = axis_columns
+            self._last_axis_rms = axis_rms or {}
+
             def compute_fft_dual(y, tv):
                 N = len(y)
                 if N < 2:
@@ -2330,11 +2375,7 @@ class MainApp:
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
-            try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
-            except Exception:
-                pass
+            text_color = "black"
 
             # Ajustar etiqueta de eje Y segun unidad seleccionada
             try:
@@ -2343,11 +2384,20 @@ class MainApp:
                 pass
 
             # Anotar RMS conforme a la unidad seleccionada
-            try:
-                text_color = "white" if self.is_dark_mode else "black"
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va="top", color=text_color)
-            except Exception:
-                pass
+            if axis_rms:
+                self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
+            else:
+                try:
+                    ax1.text(
+                        0.02,
+                        0.95,
+                        _rms_text,
+                        transform=ax1.transAxes,
+                        va="top",
+                        color=text_color,
+                    )
+                except Exception:
+                    pass
             img_time = save_plot(fig1)
 
             try:
@@ -2816,6 +2866,30 @@ class MainApp:
             _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
+
+            if axis_rms:
+                axis_table_data = [["Eje", "RMS (mm/s)", "Severidad ISO"]]
+                for axis_label in ("X", "Y", "Z"):
+                    if axis_label in axis_rms:
+                        col_name = axis_columns.get(axis_label, axis_label) if axis_columns else axis_label
+                        info = self._iso_severity_light(axis_rms.get(axis_label, 0.0))
+                        axis_table_data.append([
+                            f"{axis_label} ({col_name})" if axis_columns else axis_label,
+                            f"{axis_rms[axis_label]:.2f}",
+                            f"{info['emoji']} {info['label']}",
+                        ])
+                if "Global" in axis_rms:
+                    info_global = self._iso_severity_light(axis_rms.get("Global", 0.0))
+                    axis_table_data.append([
+                        "Global (vectorial)",
+                        f"{axis_rms.get('Global', 0.0):.2f}",
+                        f"{info_global['emoji']} {info_global['label']}",
+                    ])
+                if len(axis_table_data) > 1:
+                    axis_table = Table(axis_table_data, colWidths=[180, 100, 220])
+                    _apply_table_style(axis_table)
+                    elements.append(axis_table)
+                    elements.append(Spacer(1, 12))
 
             elements.append(Image(img_time, width=400, height=150))
             elements.append(Image(img_fft, width=400, height=150))
@@ -4205,7 +4279,13 @@ class MainApp:
 
         numeric_cols = self.current_df.select_dtypes(include=np.number).columns.tolist()
 
-        initial_time_col = "t_s" if "t_s" in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+        stored_default_time = getattr(self, "default_time_col", None)
+        if stored_default_time in numeric_cols:
+            initial_time_col = stored_default_time
+        elif "t_s" in numeric_cols:
+            initial_time_col = "t_s"
+        else:
+            initial_time_col = numeric_cols[0] if numeric_cols else None
 
 
 
@@ -4227,7 +4307,12 @@ class MainApp:
 
         # Dropdown FFT
 
-        available_signals = [col for col in numeric_cols if col != initial_time_col]
+        preferred_signals = [
+            col
+            for col in getattr(self, "default_signal_cols", [])
+            if col in numeric_cols and col != initial_time_col
+        ]
+        available_signals = preferred_signals or [col for col in numeric_cols if col != initial_time_col]
 
         self.fft_dropdown = ft.Dropdown(
 
@@ -4306,12 +4391,14 @@ class MainApp:
 
         # Señales de tiempo
 
+        default_checked = set(preferred_signals) if preferred_signals else None
         self.signal_checkboxes = [
-
-            ft.Checkbox(label=col, value=(col.startswith("a")))
-
-            for col in numeric_cols if col != initial_time_col
-
+            ft.Checkbox(
+                label=col,
+                value=(col in default_checked) if default_checked is not None else col.lower().startswith("a"),
+            )
+            for col in numeric_cols
+            if col != initial_time_col
         ]
 
         self.combine_signals_cb = ft.Checkbox(
@@ -4814,6 +4901,342 @@ class MainApp:
         """
         return np.sqrt(np.mean(signal**2))
 
+    def _calculate_band_rms_mm(
+        self,
+        time_s: np.ndarray,
+        acc_ms2: Optional[np.ndarray],
+        f_lo: float = 10.0,
+        f_hi: float = 1000.0,
+    ) -> float:
+        """Calcula RMS de velocidad [mm/s] dentro de la banda 10–1000 Hz (ISO 10816)."""
+
+        if acc_ms2 is None:
+            return 0.0
+
+        t = np.asarray(time_s, dtype=float).ravel()
+        y = np.asarray(acc_ms2, dtype=float).ravel()
+
+        if t.size < 2 or y.size < 2:
+            return 0.0
+
+        finite_mask = np.isfinite(t) & np.isfinite(y)
+        if finite_mask.sum() < 2:
+            return 0.0
+
+        t = t[finite_mask]
+        y = y[finite_mask]
+
+        if t.size < 2:
+            return 0.0
+
+        order = np.argsort(t)
+        t = t[order]
+        y = y[order]
+
+        dt_values = np.diff(t)
+        dt_values = dt_values[np.isfinite(dt_values) & (dt_values > 0)]
+        if dt_values.size == 0:
+            return 0.0
+
+        dt = float(np.median(dt_values))
+        if not np.isfinite(dt) or dt <= 0.0:
+            return 0.0
+
+        y = np.nan_to_num(y - np.nanmean(y), nan=0.0, posinf=0.0, neginf=0.0)
+
+        n = y.size
+        xf = np.fft.rfftfreq(n, dt)
+        if xf.size < 2:
+            return 0.0
+
+        Y = np.fft.rfft(y)
+        V = np.zeros_like(Y, dtype=complex)
+        V[1:] = Y[1:] / (1j * 2.0 * np.pi * xf[1:])
+        V[0] = 0.0
+
+        band_mask = (xf >= float(f_lo)) & (xf <= float(f_hi))
+        if not np.any(band_mask):
+            return 0.0
+
+        V_band = np.where(band_mask, V, 0.0)
+        v_t = np.fft.irfft(V_band, n=n)
+
+        if v_t.size == 0:
+            return 0.0
+
+        rms_vel_mm = 1000.0 * np.sqrt(np.mean(v_t**2))
+        if not np.isfinite(rms_vel_mm):
+            return 0.0
+
+        return float(rms_vel_mm)
+
+    def _calculate_rms_axes(
+        self,
+        time_s: np.ndarray,
+        acc_x: Optional[np.ndarray] = None,
+        acc_y: Optional[np.ndarray] = None,
+        acc_z: Optional[np.ndarray] = None,
+    ) -> Optional[Dict[str, float]]:
+        """Calcula RMS por eje (X, Y, Z) y global vectorial en 10–1000 Hz."""
+
+        t = np.asarray(time_s, dtype=float)
+        if t.size < 2:
+            return None
+
+        axis_values: Dict[str, float] = {}
+        for axis_key, data in (("X", acc_x), ("Y", acc_y), ("Z", acc_z)):
+            if data is None:
+                continue
+            arr = np.asarray(data, dtype=float)
+            if arr.size < 2:
+                continue
+            n = min(arr.size, t.size)
+            if n < 2:
+                continue
+            rms_val = self._calculate_band_rms_mm(t[:n], arr[:n])
+            axis_values[axis_key] = float(rms_val)
+
+        if not axis_values:
+            return None
+
+        global_val = float(np.sqrt(np.sum(np.square(list(axis_values.values())))))
+        axis_values["Global"] = global_val
+        return axis_values
+
+    def _iso_severity_light(self, rms_mm: float) -> Dict[str, str]:
+        """Devuelve la etiqueta/emoji/color de severidad ISO 10816 para un RMS (mm/s)."""
+
+        try:
+            value = float(rms_mm)
+        except Exception:
+            value = float("nan")
+
+        if not np.isfinite(value) or value < 0:
+            return {"label": "Sin datos", "color": "#7f8c8d", "emoji": "○"}
+
+        thresholds = (
+            (2.8, "Zona A - Buena", "#2ecc71", "●"),
+            (4.5, "Zona B - Satisfactoria", "#f1c40f", "●"),
+            (7.1, "Zona C - Insatisfactoria", "#e67e22", "●"),
+        )
+
+        for limit, label, color, emoji in thresholds:
+            if value <= limit:
+                return {"label": label, "color": color, "emoji": emoji}
+
+        return {"label": "Zona D - Inaceptable", "color": "#e74c3c", "emoji": "●"}
+
+    def _build_rms_semaphore_controls(self, axis_rms: Optional[Dict[str, float]]) -> List[ft.Control]:
+        """Genera tarjetas con semáforo ISO para cada eje disponible y el global."""
+
+        if not axis_rms:
+            return []
+
+        cards: List[ft.Control] = []
+        order = ("X", "Y", "Z", "Global")
+        for axis_label in order:
+            if axis_label not in axis_rms:
+                continue
+            info = self._iso_severity_light(axis_rms.get(axis_label, 0.0))
+            value = axis_rms.get(axis_label, 0.0)
+            indicator = ft.Row(
+                [
+                    ft.Container(width=12, height=12, bgcolor=info["color"], border_radius=6),
+                    ft.Text(f"{axis_label}", weight="bold"),
+                ],
+                spacing=8,
+                alignment=ft.MainAxisAlignment.START,
+            )
+            card = ft.Container(
+                content=ft.Column(
+                    [
+                        indicator,
+                        ft.Text(f"{value:.2f} mm/s", size=14, weight="bold"),
+                        ft.Text(f"{info['emoji']} {info['label']}", size=12, color=info["color"]),
+                    ],
+                    spacing=4,
+                    horizontal_alignment=ft.CrossAxisAlignment.START,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.12, info["color"]),
+                border_radius=10,
+                padding=10,
+                width=170,
+            )
+            cards.append(card)
+
+        if not cards:
+            return []
+
+        header = ft.Text("Semáforo RMS ISO 10816 (10–1000 Hz)", weight="bold")
+        row = ft.Row(controls=cards, wrap=True, spacing=12, run_spacing=12)
+        return [header, row]
+
+    def _safe_tight_layout(self, fig: Optional[plt.Figure]) -> None:
+        """Aplica tight_layout ignorando advertencias cuando no es posible ajustar."""
+
+        if fig is None:
+            return
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+
+    def _plot_rms_summary(self, ax, rms_dict: Optional[Dict[str, float]], text_color: str = "white"):
+        """Inserta en la gráfica un resumen de RMS por eje y global."""
+
+        if ax is None or not rms_dict:
+            return
+        try:
+            lines: List[str] = []
+            for axis_label in ("X", "Y", "Z", "Global"):
+                if axis_label not in rms_dict:
+                    continue
+                value = float(rms_dict.get(axis_label, 0.0))
+                info = self._iso_severity_light(value)
+                lines.append(
+                    f"{info['emoji']} {axis_label}: {value:.2f} mm/s ({info['label']})"
+                )
+            if not lines:
+                return
+            txt = "\n".join(lines)
+            ax.text(
+                0.02,
+                0.93,
+                txt,
+                transform=ax.transAxes,
+                va="top",
+                color=text_color,
+                fontsize=10,
+                bbox={
+                    "boxstyle": "round,pad=0.3",
+                    "facecolor": (0.0, 0.0, 0.0, 0.35) if text_color == "white" else (1.0, 1.0, 1.0, 0.6),
+                    "edgecolor": "none",
+                },
+            )
+        except Exception:
+            pass
+
+    def _is_axis_column(self, name: str, axis_char: str) -> bool:
+        lower = str(name or "").lower()
+        axis_char = str(axis_char).lower()
+        if not lower or not axis_char:
+            return False
+
+        direct = {
+            axis_char,
+            f"a{axis_char}",
+            f"acc{axis_char}",
+            f"acc_{axis_char}",
+            f"vel{axis_char}",
+            f"vel_{axis_char}",
+        }
+        if lower in direct:
+            return True
+
+        patterns = (
+            f"_{axis_char}",
+            f"{axis_char}_",
+            f"axis_{axis_char}",
+            f"{axis_char}axis",
+            f"{axis_char}-axis",
+            f"{axis_char} axis",
+            f"channel_{axis_char}",
+            f"{axis_char} channel",
+        )
+        if any(pat in lower for pat in patterns):
+            return True
+
+        if lower.endswith(axis_char) and any(tag in lower for tag in ("acc", "vel", "disp", "vib")):
+            return True
+
+        return False
+
+    def _get_axis_columns(self) -> Dict[str, str]:
+        if self.current_df is None:
+            return {}
+
+        try:
+            time_col = getattr(self.time_dropdown, "value", None)
+        except Exception:
+            time_col = None
+
+        axis_cols: Dict[str, str] = {}
+        preset_axes = getattr(self, "_normalized_axis_columns", None)
+        if isinstance(preset_axes, dict):
+            for axis_label, column in preset_axes.items():
+                if column in getattr(self.current_df, "columns", []):
+                    axis_cols[axis_label] = column
+
+        for axis_label, axis_char in (("X", "x"), ("Y", "y"), ("Z", "z")):
+            if axis_label in axis_cols:
+                continue
+            candidates: List[str] = []
+            for col in self.current_df.columns:
+                if col == time_col:
+                    continue
+                if col in axis_cols.values():
+                    continue
+                try:
+                    series = self.current_df[col]
+                    dtype = series.dtype
+                except Exception:
+                    continue
+                if not np.issubdtype(dtype, np.number):
+                    continue
+                if self._is_axis_column(col, axis_char):
+                    candidates.append(str(col))
+            if not candidates:
+                continue
+
+            def _score(name: str) -> int:
+                nm = name.lower()
+                score = 0
+                if nm.startswith("acc"):
+                    score += 4
+                if "acc" in nm:
+                    score += 2
+                if nm.startswith("vel"):
+                    score += 3
+                if "vel" in nm or "spd" in nm:
+                    score += 1
+                if nm.startswith(f"a{axis_char}"):
+                    score += 2
+                if nm.endswith(f"_{axis_char}") or nm.endswith(axis_char):
+                    score += 1
+                return score
+
+            best = max(candidates, key=_score)
+            axis_cols[axis_label] = best
+
+        return axis_cols
+
+    def _get_axis_data(
+        self,
+        mask: Optional[np.ndarray] = None,
+        axis_columns: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, np.ndarray]:
+        if self.current_df is None:
+            return {}
+
+        cols = axis_columns if axis_columns is not None else self._get_axis_columns()
+        if not cols:
+            return {}
+
+        data: Dict[str, np.ndarray] = {}
+        for axis_label, column in cols.items():
+            if column not in self.current_df.columns:
+                continue
+            series = pd.to_numeric(self.current_df[column], errors="coerce").to_numpy(dtype=float)
+            if mask is not None and series.size == mask.size:
+                series = series[mask]
+            series = np.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
+            if series.size < 2:
+                continue
+            data[axis_label] = series
+        return data
+
     def _format_peak_label(self, freq_hz: float, amp_mm_s: float, order: float | None = None, unit: str = "mm/s") -> str:
         label = f"{freq_hz:.2f} Hz | {amp_mm_s:.3f} {unit}"
         try:
@@ -5019,7 +5442,7 @@ class MainApp:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
-            fig.tight_layout()
+            self._safe_tight_layout(fig)
             return fig
         except Exception:
             return None
@@ -5106,7 +5529,17 @@ class MainApp:
             except Exception:
                 std_x = std_y = None
             try:
-                corr_val = float(np.corrcoef(x_filt, y_filt)[0, 1])
+                if (
+                    std_x is not None
+                    and std_y is not None
+                    and np.isfinite(std_x)
+                    and np.isfinite(std_y)
+                    and std_x > 1e-12
+                    and std_y > 1e-12
+                ):
+                    corr_val = float(np.corrcoef(x_filt, y_filt)[0, 1])
+                else:
+                    corr_val = None
             except Exception:
                 corr_val = None
             try:
@@ -5264,7 +5697,7 @@ class MainApp:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
                 ax.legend(loc="upper right", fontsize=8)
-            fig.tight_layout()
+            self._safe_tight_layout(fig)
             return fig
         except Exception:
             return None
@@ -5399,14 +5832,87 @@ class MainApp:
             rms_mm = 0.0
             sev_label = 'N/D'
 
-        # Enfoque
+        # Enfoque y severidad global
         lines.append("Enfoque: motor eléctrico")
 
-        # Severidad
         try:
             lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
         except Exception:
             pass
+
+        axis_rms = getattr(self, "_last_axis_rms", {}) or {}
+
+        def _sev_rank(value: float) -> int:
+            try:
+                v = float(value)
+            except Exception:
+                return -1
+            if not np.isfinite(v) or v < 0:
+                return -1
+            if v <= 2.8:
+                return 0
+            if v <= 4.5:
+                return 1
+            if v <= 7.1:
+                return 2
+            return 3
+
+        if axis_rms:
+            axis_parts: List[str] = []
+            worst_axis: Optional[str] = None
+            worst_rank = -1
+            conversions: List[str] = []
+            axis_columns = getattr(self, "_last_axis_columns", {}) or {}
+            axis_scales = getattr(self, "_axis_unit_scales", {}) or {}
+            for axis_label, column_name in axis_columns.items():
+                scale = axis_scales.get(column_name)
+                if scale is None or not np.isfinite(scale):
+                    continue
+                if np.isclose(scale, 1.0):
+                    continue
+                if scale > 1.0:
+                    conversions.append(
+                        f"{axis_label}: valores escalados ×{scale:.3f} para llevar la señal a m/s²."
+                    )
+                else:
+                    conversions.append(
+                        f"{axis_label}: valores escalados ×{scale:.6f} para llevar la señal a m/s²."
+                    )
+            for axis_label in ("X", "Y", "Z", "Global"):
+                if axis_label not in axis_rms:
+                    continue
+                try:
+                    value = float(axis_rms.get(axis_label, 0.0))
+                except Exception:
+                    value = 0.0
+                info = self._iso_severity_light(value)
+                axis_parts.append(
+                    f"{info['emoji']} {axis_label}: {value:.2f} mm/s ({info['label']})"
+                )
+                rank = _sev_rank(value)
+                if rank > worst_rank:
+                    worst_rank = rank
+                    worst_axis = axis_label
+            if axis_parts:
+                lines.append(
+                    "RMS por eje (10–1000 Hz): " + " | ".join(axis_parts)
+                )
+            if conversions:
+                lines.append(
+                    "Normalización de unidades aplicada: " + "; ".join(conversions)
+                )
+            if worst_axis:
+                if worst_axis == "Global" and worst_rank >= 0:
+                    if worst_rank >= 3:
+                        lines.append("Acción inmediata: detener y corregir, el RMS global está en zona D (inaceptable).")
+                    elif worst_rank == 2:
+                        lines.append("Planifica una intervención a corto plazo: el RMS global se ubica en zona C (insatisfactoria).")
+                    elif worst_rank == 1:
+                        lines.append("Mantén vigilancia estrecha: el RMS global está en zona B, recomienda seguimiento frecuente.")
+                elif worst_rank >= 1:
+                    lines.append(
+                        f"Prioriza mediciones y ajustes sobre el eje {worst_axis}: su RMS supera la zona A y domina la condición."
+                    )
 
         # Energía por bandas
         try:
@@ -5881,9 +6387,42 @@ class MainApp:
 
                 return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
-
-
-
+            axis_columns = self._get_axis_columns()
+            axis_segments = self._get_axis_data(mask, axis_columns)
+            axis_rms = None
+            if axis_segments:
+                axis_rms = self._calculate_rms_axes(
+                    t_segment,
+                    axis_segments.get("X"),
+                    axis_segments.get("Y"),
+                    axis_segments.get("Z"),
+                )
+            elif getattr(self, "uploaded_files", None):
+                try:
+                    raw_df, _, _ = self._load_vibration_csv(self.uploaded_files[0])
+                    time_s = raw_df.get("time")
+                    if time_s is not None:
+                        time_vals = pd.to_numeric(time_s, errors="coerce").to_numpy(dtype=float)
+                        acc_x = (
+                            pd.to_numeric(raw_df.get("accX"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accX" in raw_df.columns
+                            else None
+                        )
+                        acc_y = (
+                            pd.to_numeric(raw_df.get("accY"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accY" in raw_df.columns
+                            else None
+                        )
+                        acc_z = (
+                            pd.to_numeric(raw_df.get("accZ"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+                            if "accZ" in raw_df.columns
+                            else None
+                        )
+                        axis_rms = self._calculate_rms_axes(time_vals, acc_x, acc_y, acc_z)
+                except Exception as exc:
+                    print(f"Error calculando RMS por ejes: {exc}")
+            self._last_axis_columns = axis_columns
+            self._last_axis_rms = axis_rms or {}
 
             # --- Features + diagnóstico baseline ---
 
@@ -6056,14 +6595,22 @@ class MainApp:
 
             ax1.set_ylabel("Aceleración [m/s²]")
 
-            # Anotar RMS de Aceleracion (tiempo)
-            try:
-                text_color = "white" if self.is_dark_mode else "black"
-                rms_acc = self._calculate_rms(signal_segment)
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes,
-                         va="top", color=text_color)
-            except Exception:
-                pass
+            text_color = "white" if self.is_dark_mode else "black"
+
+            if axis_rms:
+                self._plot_rms_summary(ax1, axis_rms, text_color=text_color)
+            else:
+                try:
+                    ax1.text(
+                        0.02,
+                        0.95,
+                        _rms_text,
+                        transform=ax1.transAxes,
+                        va="top",
+                        color=text_color,
+                    )
+                except Exception:
+                    pass
 
 
             # Aplicar filtros visuales de frecuencia (LF y/o límite HF)
@@ -6425,7 +6972,7 @@ class MainApp:
 
                     aux_ax.legend()
 
-                    aux_fig.tight_layout()
+                    self._safe_tight_layout(aux_fig)
 
                     aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
                     plt.close(aux_fig)
@@ -6439,18 +6986,23 @@ class MainApp:
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
+            resumen_exec_controls: List[ft.Control] = [
+                ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
+                ft.Row([
+                    ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
+                    ft.Text(f"Clasificación ISO: {sev_label}")
+                ]),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+            ]
+            if axis_rms:
+                resumen_exec_controls.extend(self._build_rms_semaphore_controls(axis_rms))
+            else:
+                resumen_exec_controls.append(ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"))
+            resumen_exec_controls.append(ft.Text("Diagnóstico:"))
+            resumen_exec_controls.extend(ft.Text(f"- {it}") for it in exec_findings)
+
             resumen_exec = ft.Container(
-                content=ft.Column([
-                    ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
-                    ft.Row([
-                        ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
-                        ft.Text(f"Clasificación ISO: {sev_label}")
-                    ]),
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                    ft.Text("Diagnóstico:"),
-                    *[ft.Text(f"- {it}") for it in exec_findings],
-                ], spacing=6),
+                content=ft.Column(resumen_exec_controls, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
                 border_radius=10,
                 padding=10
@@ -6458,30 +7010,26 @@ class MainApp:
 
             # --- Panel resumen + diagnóstico ---
 
+            resumen_controls: List[ft.Control] = [
+                ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
+                ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text(
+                    "Crest factor (aceleración): "
+                    f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                ),
+            ]
+            if axis_rms:
+                resumen_controls.extend(self._build_rms_semaphore_controls(axis_rms))
+            else:
+                resumen_controls.append(ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"))
+            resumen_controls.append(ft.Divider())
+            resumen_controls.append(ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"))
+            resumen_controls.extend(ft.Text(f"• {it}") for it in findings)
+
             resumen = ft.Container(
 
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
+                content=ft.Column(resumen_controls, spacing=6),
 
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
 
@@ -7590,21 +8138,269 @@ class MainApp:
 
 
 
+    def _normalize_vibration_dataframe(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, str]]:
+        """Normaliza columnas de tiempo/ejes para datasets industriales o de laboratorio."""
+
+        def _coerce_axis_units(series: pd.Series, column_name: str) -> Tuple[pd.Series, float]:
+            """Convierte a m/s² si la columna está en g, mg, cm/s² o mm/s²."""
+
+            numeric = pd.to_numeric(series, errors="coerce")
+            lower = str(column_name).strip().lower()
+            tokens = [tok for tok in re.split(r"[^a-z0-9]+", lower) if tok]
+            token_set = set(tokens)
+            normalized = re.sub(r"[^a-z0-9/^]", "", lower)
+
+            has_ms2 = (
+                "m/s2" in normalized
+                or "m/s^2" in lower
+                or "mps2" in normalized
+                or "mpss" in normalized
+                or "ms-2" in lower
+                or "m·s-2" in lower
+                or "m•s-2" in lower
+                or "ms2" in token_set
+            )
+            has_mm = "mm/s2" in normalized or "mmps2" in normalized or "mms2" in token_set
+            has_cm = "cm/s2" in normalized or "cmps2" in normalized or "cms2" in token_set or "gal" in token_set
+            has_mg = "mg" in token_set or "milli-g" in lower or "millig" in lower
+            has_gravity = bool(token_set & {"g", "grms", "g_rms", "rmsg"}) or "(g)" in lower or bool(re.search(r"\bg\b", lower))
+
+            scale = 1.0
+            if has_ms2:
+                scale = 1.0
+            elif has_mm:
+                scale = 1e-3
+            elif has_cm:
+                scale = 1e-2
+            elif has_mg:
+                scale = 9.80665e-3
+            elif has_gravity and not token_set & {"avg", "avgx", "avgy", "avgz"}:
+                scale = 9.80665
+
+            converted = numeric.astype(float) * scale
+            return converted, scale
+
+        self._axis_unit_scales = {}
+
+        if df is None or getattr(df, "empty", True):
+            return df, None, {}
+
+        normalized_df = df.copy()
+        column_names = [str(col) for col in normalized_df.columns]
+        lower_map = {col: str(col).strip().lower() for col in column_names}
+
+        def _unique_name(base: str) -> str:
+            candidate = base
+            suffix = 1
+            while candidate in normalized_df.columns:
+                candidate = f"{base}_{suffix}"
+                suffix += 1
+            return candidate
+
+        time_keywords = (
+            "time",
+            "t_s",
+            "tiempo",
+            "sample",
+            "timestamp",
+            "time[s]",
+            "t (s)",
+        )
+
+        time_col: Optional[str] = None
+        for name in column_names:
+            lower = lower_map.get(name, "")
+            if any(keyword in lower for keyword in time_keywords):
+                time_col = name
+                break
+
+        numeric_cols = [
+            name
+            for name in column_names
+            if pd.api.types.is_numeric_dtype(normalized_df[name])
+        ]
+
+        if time_col is None:
+            for name in numeric_cols:
+                lower = lower_map.get(name, "")
+                if lower.startswith("t") or lower.endswith("time"):
+                    time_col = name
+                    break
+
+        target_time_col: Optional[str]
+        if time_col is not None:
+            time_series = pd.to_numeric(normalized_df[time_col], errors="coerce")
+            if time_series.isna().all():
+                try:
+                    time_series = pd.to_datetime(normalized_df[time_col], errors="coerce")
+                    if not time_series.isna().all():
+                        base = time_series.dropna().iloc[0]
+                        time_series = (time_series - base).dt.total_seconds()
+                except Exception:
+                    pass
+            if isinstance(time_series, pd.Series):
+                time_values = time_series.to_numpy(dtype=float)
+            else:
+                time_values = np.asarray(time_series, dtype=float)
+            # Reubicar el eje temporal para que siempre inicie en 0 s
+            if time_values.size:
+                try:
+                    base_time = float(np.nanmin(time_values))
+                except (ValueError, TypeError):
+                    base_time = 0.0
+                if np.isfinite(base_time):
+                    time_values = time_values - base_time
+            if not np.isfinite(time_values).any():
+                time_values = np.arange(len(normalized_df), dtype=float) / 10000.0
+            target_time_col = str(time_col)
+            normalized_df[target_time_col] = time_values
+        else:
+            target_time_col = "time"
+            if target_time_col in normalized_df.columns:
+                target_time_col = _unique_name(target_time_col)
+            normalized_df[target_time_col] = np.arange(len(normalized_df), dtype=float) / 10000.0
+
+        axis_candidates: Dict[str, List[Tuple[int, str]]] = {"X": [], "Y": [], "Z": []}
+        general_candidates: List[Tuple[int, str]] = []
+        column_index = {name: idx for idx, name in enumerate(column_names)}
+
+        def _score_axis(name: str, axis_char: str) -> int:
+            lower = name.lower()
+            tokens = [tok for tok in re.split(r"[^a-z0-9]+", lower) if tok]
+            score = 0
+            if axis_char in tokens:
+                score += 4
+            if f"axis{axis_char}" in tokens or f"{axis_char}axis" in tokens:
+                score += 3
+            if any(tok.startswith(axis_char) for tok in tokens):
+                score += 2
+            if f"acc{axis_char}" in lower or f"a{axis_char}" in lower:
+                score += 3
+            if lower.endswith(axis_char) or lower.startswith(axis_char):
+                score += 1
+            if any(keyword in lower for keyword in ("acc", "acel", "vib", "vel", "disp", "ms2", "g")):
+                score += 2
+            return score
+
+        numeric_like: Dict[str, pd.Series] = {}
+        for name in column_names:
+            if name == target_time_col:
+                continue
+            series = pd.to_numeric(normalized_df[name], errors="coerce")
+            if series.notna().sum() < max(3, int(0.02 * len(series))):
+                continue
+            numeric_like[name] = series
+            lower = lower_map.get(name, "")
+            if any(keyword in lower for keyword in ("acc", "acel", "vib", "vel", "ms2", "g")):
+                general_candidates.append((5, name))
+            for axis_label, axis_char in (("X", "x"), ("Y", "y"), ("Z", "z")):
+                score = _score_axis(name, axis_char)
+                if score > 0:
+                    axis_candidates[axis_label].append((score, name))
+
+        used_cols: Set[str] = set()
+        detected_axes: Dict[str, str] = {}
+        for axis_label in ("X", "Y", "Z"):
+            candidates = axis_candidates.get(axis_label, [])
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], -column_index.get(item[1], 0)), reverse=True)
+                for _, candidate_name in candidates:
+                    if candidate_name in used_cols:
+                        continue
+                    detected_axes[axis_label] = candidate_name
+                    used_cols.add(candidate_name)
+                    break
+
+        if "X" not in detected_axes and general_candidates:
+            general_candidates.sort(key=lambda item: (-item[0], column_index.get(item[1], 0)))
+            for _, candidate_name in general_candidates:
+                if candidate_name in used_cols:
+                    continue
+                detected_axes["X"] = candidate_name
+                used_cols.add(candidate_name)
+                break
+
+        if not detected_axes and numeric_cols:
+            for name in numeric_cols:
+                if name == target_time_col:
+                    continue
+                detected_axes["X"] = name
+                break
+
+        normalized_axes: Dict[str, str] = {}
+        for axis_label, source_col in detected_axes.items():
+            canonical_col = f"acc{axis_label}"
+            if str(source_col) == canonical_col:
+                target_col = canonical_col
+            else:
+                target_col = canonical_col if canonical_col not in normalized_df.columns else _unique_name(canonical_col)
+            source_series = numeric_like.get(
+                source_col,
+                pd.to_numeric(normalized_df[source_col], errors="coerce"),
+            )
+            converted_series, scale = _coerce_axis_units(source_series, source_col)
+            normalized_df[target_col] = converted_series.astype(float)
+            normalized_axes[axis_label] = target_col
+            self._axis_unit_scales[target_col] = scale
+
+        for axis_label in ("X", "Y", "Z"):
+            col_name = f"acc{axis_label}"
+            if col_name not in normalized_df.columns:
+                normalized_df[col_name] = np.nan
+
+        return normalized_df, target_time_col, normalized_axes
+
+    def _load_vibration_csv(
+        self,
+        file_path: str,
+    ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, str]]:
+        """Carga un CSV de vibraciones manejando formatos industriales o de laboratorio."""
+
+        last_error: Optional[Exception] = None
+        read_attempts = (
+            {},
+            {"sep": ";"},
+            {"sep": None, "engine": "python"},
+        )
+
+        for params in read_attempts:
+            try:
+                df = pd.read_csv(file_path, **params)
+                if getattr(df, "empty", False):
+                    continue
+                return self._normalize_vibration_dataframe(df)
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+
+        empty_df = pd.DataFrame()
+        return empty_df, None, {}
+
     def _load_file_data(self, file_path):
 
         try:
 
+            normalized_time: Optional[str] = None
+            normalized_axes: Dict[str, str] = {}
+
             if file_path.endswith('.csv'):
 
-                df = pd.read_csv(file_path)
+                df, normalized_time, normalized_axes = self._load_vibration_csv(file_path)
 
             elif file_path.endswith('.xlsx'):
 
                 df = pd.read_excel(file_path)
+                df, normalized_time, normalized_axes = self._normalize_vibration_dataframe(df)
 
             else:
 
                 df = pd.read_csv(file_path)
+                df, normalized_time, normalized_axes = self._normalize_vibration_dataframe(df)
 
 
 
@@ -7636,9 +8432,44 @@ class MainApp:
 
             time_candidates = [c for c in numeric_cols if "t" in c.lower()]
 
-            self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
+            default_time = None
+            if normalized_time and normalized_time in numeric_cols:
+                default_time = normalized_time
+            elif self.default_time_col and self.default_time_col in numeric_cols:
+                default_time = self.default_time_col
+            elif time_candidates:
+                default_time = time_candidates[0]
+            elif numeric_cols:
+                default_time = numeric_cols[0]
 
-            self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
+            self.default_time_col = default_time
+
+            preferred_signals = [col for col in normalized_axes.values() if col in numeric_cols]
+            if not preferred_signals:
+                preferred_signals = [
+                    c
+                    for c in numeric_cols
+                    if c != self.default_time_col and pd.to_numeric(df[c], errors="coerce").notna().any()
+                ]
+            if not preferred_signals:
+                preferred_signals = [c for c in numeric_cols if c != self.default_time_col]
+
+            self.default_signal_cols = preferred_signals
+            self._normalized_axis_columns = normalized_axes or {}
+
+            if normalized_axes:
+                formatted_axes = ", ".join(f"{axis}: {col}" for axis, col in normalized_axes.items())
+                self._log(f"Ejes detectados: {formatted_axes}")
+                conversions = []
+                for axis_label, column_name in normalized_axes.items():
+                    scale = self._axis_unit_scales.get(column_name)
+                    if scale is None or not np.isfinite(scale) or np.isclose(scale, 1.0):
+                        continue
+                    conversions.append(f"{axis_label} ×{scale:.3f}")
+                if conversions:
+                    self._log(
+                        "Ajuste de unidades aplicado (→ m/s²): " + ", ".join(conversions)
+                    )
 
 
 
