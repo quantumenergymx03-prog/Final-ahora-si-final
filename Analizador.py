@@ -7,6 +7,7 @@ from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
 import matplotlib
+from collections import Counter
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -36,6 +37,11 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import tempfile
 import shutil
+
+try:
+    import joblib
+except ImportError:  # pragma: no cover - disponibilidad opcional
+    joblib = None
 
 APP_VERSION = "v1.0.0"
 
@@ -144,6 +150,268 @@ CHARLOTTE_MOTOR_FAULTS: List[Dict[str, str]] = [
         "description": "Picos a frecuencias de aspas/paletas y subarmónicos modulados.",
     },
 ]
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return float(default)
+
+
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "modelo_vibraciones.pkl")
+ML_WINDOW_SECONDS = _env_float("ML_WINDOW_SECONDS", 10.0)
+
+
+class VibrationMLAnalyzer:
+    """Analizador de diagnóstico asistido por machine learning."""
+
+    FEATURE_COLUMNS: List[str] = [
+        "rms_acc_ms2",
+        "peak_acc_ms2",
+        "pp_acc_ms2",
+        "rms_vel_mm_s",
+        "dom_freq_hz",
+        "dom_amp_mm_s",
+        "r2x",
+        "r3x",
+        "energy_low",
+        "energy_mid",
+        "energy_high",
+    ]
+
+    def __init__(self, model_path: str, window_seconds: float = 10.0):
+        self.model_path = model_path
+        self.window_seconds = max(float(window_seconds), 0.0)
+        self._model = None
+        self._load_error: Optional[str] = None
+        self._load_attempted = False
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        if self._load_attempted:
+            return None
+        self._load_attempted = True
+        if joblib is None:
+            self._load_error = "joblib no disponible"
+            return None
+        if not self.model_path or not os.path.exists(self.model_path):
+            self._load_error = f"modelo no encontrado: {self.model_path}"
+            return None
+        try:
+            self._model = joblib.load(self.model_path)
+        except Exception as ex:  # pragma: no cover - depende del modelo externo
+            self._model = None
+            self._load_error = str(ex)
+        return self._model
+
+    @staticmethod
+    def _clean_inputs(time_s: np.ndarray, acc_ms2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        t = np.asarray(time_s, dtype=float).ravel()
+        a = np.asarray(acc_ms2, dtype=float).ravel()
+        mask = np.isfinite(t) & np.isfinite(a)
+        t = t[mask]
+        a = a[mask]
+        if t.size > 1 and not np.all(np.diff(t) >= 0):
+            idx = np.argsort(t)
+            t = t[idx]
+            a = a[idx]
+        return t, a
+
+    def _extract_features(self, time_s: np.ndarray, acc_ms2: np.ndarray) -> Optional[Dict[str, float]]:
+        time_s = np.asarray(time_s, dtype=float)
+        acc_ms2 = np.asarray(acc_ms2, dtype=float)
+        if time_s.size < 2:
+            return None
+        t_rel = time_s - time_s[0]
+        try:
+            p = np.polyfit(t_rel, acc_ms2, 1)
+            acc_detrended = acc_ms2 - (p[0] * t_rel + p[1])
+        except Exception:
+            acc_detrended = acc_ms2 - float(np.mean(acc_ms2))
+        dt = float(np.median(np.diff(t_rel))) if t_rel.size > 1 else 0.0
+        if not np.isfinite(dt) or dt <= 0.0:
+            return None
+        fs = 1.0 / dt
+        n = acc_detrended.size
+        if n < 8:
+            return None
+
+        w = np.hanning(n)
+        cg = float(np.mean(w)) if np.mean(w) else 1.0
+        Y = np.fft.rfft(acc_detrended * w)
+        f = np.fft.rfftfreq(n, dt)
+        mag = np.abs(Y) / (n * cg)
+        if n % 2 == 0 and mag.size >= 2:
+            mag[1:-1] *= 2.0
+        elif n % 2 == 1 and mag.size >= 2:
+            mag[1:] *= 2.0
+        mag[f < 0.5] = 0.0
+
+        mag_vel_mm = np.zeros_like(mag)
+        pos = f > 0
+        mag_vel_mm[pos] = mag[pos] / (2.0 * np.pi * f[pos]) * 1000.0
+
+        rms_acc = float(np.sqrt(np.mean(acc_detrended ** 2))) if n else 0.0
+        peak_acc = float(np.max(np.abs(acc_detrended))) if n else 0.0
+        pp_acc = float(np.ptp(acc_detrended)) if n else 0.0
+
+        Yv = np.copy(Y)
+        if np.any(pos):
+            Yv[pos] /= (1j * 2.0 * np.pi * f[pos])
+        Yv[0] = 0.0
+        v_t = np.fft.irfft(Yv, n)
+        rms_vel = 1000.0 * float(np.sqrt(np.mean(v_t ** 2))) if n else 0.0
+
+        dom_idx = int(np.argmax(mag_vel_mm)) if mag_vel_mm.size else 0
+        dom_freq = float(f[dom_idx]) if f.size else 0.0
+
+        def amp_near(freq: float) -> float:
+            if freq is None or freq <= 0.0 or not np.isfinite(freq):
+                return 0.0
+            bw = max(0.02 * freq, 2.0 * (fs / max(n, 1)))
+            idx = (f >= (freq - bw)) & (f <= (freq + bw))
+            return float(np.max(mag_vel_mm[idx])) if np.any(idx) else 0.0
+
+        dom_amp = amp_near(dom_freq)
+        a2x = amp_near(2.0 * dom_freq)
+        a3x = amp_near(3.0 * dom_freq)
+        r2x = float(a2x / (dom_amp + 1e-12))
+        r3x = float(a3x / (dom_amp + 1e-12))
+
+        energy_total = float(np.sum(mag_vel_mm ** 2))
+        energy_low = float(np.sum(mag_vel_mm[(f >= 0.0) & (f < 30.0)] ** 2)) if mag_vel_mm.size else 0.0
+        energy_mid = float(np.sum(mag_vel_mm[(f >= 30.0) & (f < 120.0)] ** 2)) if mag_vel_mm.size else 0.0
+        energy_high = float(np.sum(mag_vel_mm[f >= 120.0] ** 2)) if mag_vel_mm.size else 0.0
+        denom = energy_total + 1e-12
+
+        return {
+            "rms_acc_ms2": rms_acc,
+            "peak_acc_ms2": peak_acc,
+            "pp_acc_ms2": pp_acc,
+            "rms_vel_mm_s": rms_vel,
+            "dom_freq_hz": dom_freq,
+            "dom_amp_mm_s": dom_amp,
+            "r2x": r2x,
+            "r3x": r3x,
+            "energy_low": energy_low / denom,
+            "energy_mid": energy_mid / denom,
+            "energy_high": energy_high / denom,
+        }
+
+    def _feature_table(self, time_s: np.ndarray, acc_ms2: np.ndarray) -> Tuple[pd.DataFrame, float]:
+        t, a = self._clean_inputs(time_s, acc_ms2)
+        if t.size < 2:
+            return pd.DataFrame(), 0.0
+        dt = float(np.median(np.diff(t))) if t.size > 1 else 0.0
+        if not np.isfinite(dt) or dt <= 0.0:
+            return pd.DataFrame(), 0.0
+        fs_est = 1.0 / dt
+        samples_per_win = max(int(round(self.window_seconds * fs_est)), 1)
+        if samples_per_win > a.size:
+            samples_per_win = a.size
+        if samples_per_win < 16 or a.size < samples_per_win:
+            if a.size >= 16:
+                samples_per_win = a.size
+            else:
+                return pd.DataFrame(), fs_est
+        rows: List[Dict[str, Any]] = []
+        base_t = float(t[0])
+        step = max(samples_per_win, 1)
+        limit = a.size - samples_per_win + 1
+        for start in range(0, max(limit, 0), step):
+            end = start + samples_per_win
+            if end > a.size:
+                break
+            sub_t = t[start:end]
+            sub_a = a[start:end]
+            feat = self._extract_features(sub_t, sub_a)
+            if not feat:
+                continue
+            feat["window_number"] = len(rows) + 1
+            feat["window_start_s"] = float(sub_t[0] - base_t)
+            feat["window_end_s"] = float(sub_t[-1] - base_t)
+            feat["fs_hz"] = fs_est
+            rows.append(feat)
+        df = pd.DataFrame(rows)
+        return df, fs_est
+
+    def predict(self, time_s: np.ndarray, acc_ms2: np.ndarray) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "model_path": self.model_path,
+            "window_seconds": self.window_seconds,
+        }
+        try:
+            df_feat, fs_est = self._feature_table(time_s, acc_ms2)
+            result["fs_est_hz"] = float(fs_est) if np.isfinite(fs_est) else None
+            result["n_windows"] = int(len(df_feat))
+            feature_rows = df_feat.to_dict("records") if not df_feat.empty else []
+            result["feature_rows"] = feature_rows
+            if df_feat.empty:
+                result["enabled"] = False
+                result["error"] = "sin ventanas suficientes para ML"
+                return result
+            model = self._load_model()
+            if model is None:
+                result["enabled"] = False
+                result["error"] = self._load_error or "modelo ML no disponible"
+                return result
+            X = df_feat[self.FEATURE_COLUMNS].copy()
+            preds_raw = model.predict(X)
+            pred_labels = [str(p) for p in preds_raw]
+            counts = Counter(pred_labels)
+            result["enabled"] = True
+            result["predictions"] = pred_labels
+            result["counts"] = {str(k): int(v) for k, v in counts.items()}
+            top_label = counts.most_common(1)[0][0] if counts else None
+            result["top_prediction"] = top_label
+
+            classes_raw = getattr(model, "classes_", None)
+            probability_rows: List[Dict[str, float]] = []
+            top_probability: Optional[float] = None
+            class_labels: List[str] = []
+            if hasattr(model, "predict_proba"):
+                try:
+                    proba = model.predict_proba(X)
+                    if classes_raw is not None and len(classes_raw) == proba.shape[1]:
+                        class_labels = [str(c) for c in classes_raw]
+                    else:
+                        class_labels = [f"Clase {i}" for i in range(proba.shape[1])]
+                    class_map = {label: idx for idx, label in enumerate(class_labels)}
+                    for i, feat_row in enumerate(feature_rows):
+                        prob_dict = {class_labels[j]: float(proba[i, j]) for j in range(len(class_labels))}
+                        probability_rows.append(prob_dict)
+                        label = pred_labels[i]
+                        idx = class_map.get(label)
+                        if idx is not None:
+                            feat_row["prediction_probability"] = float(proba[i, idx])
+                    if top_label and top_label in class_map:
+                        probs = [float(proba[i, class_map[top_label]]) for i in range(len(pred_labels))]
+                        if probs:
+                            top_probability = float(np.mean(probs))
+                    result["classes"] = class_labels
+                except Exception as ex:  # pragma: no cover - depende del modelo
+                    result["probability_error"] = str(ex)
+                    probability_rows = []
+            if probability_rows:
+                result["probabilities"] = probability_rows
+            if top_probability is not None:
+                result["top_probability"] = top_probability
+            for i, feat_row in enumerate(feature_rows):
+                feat_row["prediction"] = pred_labels[i]
+            return result
+        except Exception as ex:  # pragma: no cover - defensivo frente a datos externos
+            result["enabled"] = False
+            result["error"] = str(ex)
+            result["n_windows"] = int(result.get("n_windows", 0))
+            if "feature_rows" not in result:
+                result["feature_rows"] = []
+            return result
+
+
+ML_ANALYZER = VibrationMLAnalyzer(ML_MODEL_PATH, ML_WINDOW_SECONDS)
+
 
 
 def _charlotte_faults_lines() -> List[str]:
@@ -839,7 +1107,21 @@ def analyze_vibration(
     if len(findings) == 1:
         findings.append("Sin anomalías evidentes según reglas actuales.")
     severity_summary, core_findings = _split_diagnosis(findings)
-    return {
+
+    ml_result: Optional[Dict[str, Any]] = None
+    if ML_ANALYZER is not None:
+        try:
+            ml_result = ML_ANALYZER.predict(t, a)
+        except Exception as ex:  # pragma: no cover - defensivo
+            ml_result = {
+                "enabled": False,
+                "error": str(ex),
+                "model_path": ML_MODEL_PATH,
+                "feature_rows": [],
+                "n_windows": 0,
+            }
+
+    result = {
         "segment_used": (float(t[0]), float(t[-1])),
         "fs_hz": fs,
         "dt_s": dt,
@@ -878,6 +1160,11 @@ def analyze_vibration(
         "charlotte_catalog": [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS],
         "charlotte_lines": _charlotte_faults_lines(),
     }
+
+    if ml_result is not None:
+        result["ml"] = ml_result
+
+    return result
 
 
 
@@ -2610,7 +2897,7 @@ class MainApp:
                     (cb.label, color_dd.value, style_dd.value)
                     for cb, color_dd, style_dd in getattr(self, "aux_controls", [])
                     if getattr(cb, "value", False)
-                ]
+                        ]
             except Exception:
                 aux_selected = []
             for col, color, style in aux_selected:
@@ -2744,6 +3031,12 @@ class MainApp:
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
             exec_findings_clean = [_sanitize_text(text) for text in exec_findings]
+            ml_block_pdf = res.get('ml') or {}
+            ml_summary_pdf_short = self._ml_summary_lines(ml_block_pdf, short=True)
+            ml_summary_pdf_full = self._ml_summary_lines(ml_block_pdf)
+            ml_feature_rows_pdf = ml_block_pdf.get('feature_rows') or []
+            ml_summary_pdf_short_clean = [_sanitize_text(line) for line in ml_summary_pdf_short]
+            ml_summary_pdf_full_clean = [_sanitize_text(line) for line in ml_summary_pdf_full]
 
             elements = []
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
@@ -2760,6 +3053,8 @@ class MainApp:
                 ["Clasificacion ISO", severity_clean or "N/D"],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
+            if ml_summary_pdf_short_clean:
+                cover_summary.append(["Diagnóstico ML", " ".join(ml_summary_pdf_short_clean)])
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
             _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
@@ -2784,6 +3079,8 @@ class MainApp:
                 ["Frecuencia dominante (Hz)", f"{features_full['dom_freq']:.2f}"],
                 ["Filtro FFT", _pdf_fft_filter_note],
             ]
+            if ml_summary_pdf_short_clean:
+                summary_exec.append(["Diagnóstico ML", " ".join(ml_summary_pdf_short_clean)])
             summary_exec_table = Table(summary_exec, colWidths=[190, 210])
             _apply_table_style(summary_exec_table)
             elements.append(summary_exec_table)
@@ -2806,6 +3103,22 @@ class MainApp:
             if severity_entry_clean and severity_entry_clean not in exec_findings_clean:
                 elements.append(Paragraph(severity_entry_clean, styles['Muted']))
             elements.append(Spacer(1, 10))
+            if ml_summary_pdf_full_clean:
+                elements.append(Paragraph("Diagnóstico asistido por ML", styles['Subheading']))
+                ml_bullets_pdf = [
+                    ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                    for text in ml_summary_pdf_full_clean
+                ]
+                elements.append(
+                    ListFlowable(
+                        ml_bullets_pdf,
+                        bulletType='bullet',
+                        bulletColor=accent_color,
+                        start='bulletchar',
+                        leftIndent=16,
+                    )
+                )
+                elements.append(Spacer(1, 10))
             # Semáforo de severidad (actual + otros atenuados)
             try:
                 # Mapear label a índice
@@ -2888,6 +3201,53 @@ class MainApp:
             elements.append(Paragraph(f"Archivo: {base_name}", styles['Muted']))
             elements.append(Paragraph(f"Segmento: {start_t:.2f}s – {end_t:.2f}s", styles['Muted']))
             elements.append(Spacer(1, 10))
+            if ml_summary_pdf_full_clean:
+                elements.append(Paragraph("Diagnóstico asistido por ML", styles['Subheading']))
+                for line in ml_summary_pdf_full_clean:
+                    elements.append(Paragraph(line, styles['Normal']))
+                elements.append(Spacer(1, 8))
+            if ml_feature_rows_pdf:
+                elements.append(Paragraph("Ventanas evaluadas por ML", styles['Subheading']))
+                ml_table_header = ["Ventana", "Rango (s)", "RMS vel (mm/s)", "Freq dom (Hz)", "Diagnóstico ML"]
+                show_prob_pdf = any(row.get("prediction_probability") is not None for row in ml_feature_rows_pdf)
+                if show_prob_pdf:
+                    ml_table_header.append("Confianza")
+                ml_table_data = [ml_table_header]
+                for row in ml_feature_rows_pdf[:12]:
+                    number = row.get("window_number") or row.get("window_index") or len(ml_table_data)
+                    try:
+                        number_text = str(int(number))
+                    except Exception:
+                        number_text = str(len(ml_table_data))
+                    try:
+                        range_text = f"{float(row.get('window_start_s', 0.0)):.2f} – {float(row.get('window_end_s', 0.0)):.2f}"
+                    except Exception:
+                        range_text = "-"
+                    try:
+                        rms_text = f"{float(row.get('rms_vel_mm_s', 0.0)):.3f}"
+                    except Exception:
+                        rms_text = "-"
+                    try:
+                        freq_text = f"{float(row.get('dom_freq_hz', 0.0)):.2f}"
+                    except Exception:
+                        freq_text = "-"
+                    pred_text = _sanitize_text(row.get('prediction', '-') or '-')
+                    row_vals = [number_text, range_text, rms_text, freq_text, pred_text]
+                    if show_prob_pdf:
+                        prob = row.get('prediction_probability')
+                        try:
+                            prob_text = f"{float(prob) * 100.0:.1f}%"
+                        except Exception:
+                            prob_text = "-"
+                        row_vals.append(prob_text)
+                    ml_table_data.append(row_vals)
+                ml_col_widths = [70, 120, 110, 110, 140]
+                if show_prob_pdf:
+                    ml_col_widths.append(90)
+                ml_table = Table(ml_table_data, colWidths=ml_col_widths)
+                _apply_table_style(ml_table)
+                elements.append(ml_table)
+                elements.append(Spacer(1, 12))
 
             # Top picos (FFT)
             if top_peaks:
@@ -5487,6 +5847,122 @@ class MainApp:
                     break
         return selected
 
+    def _ml_summary_lines(self, ml_block: Optional[Dict[str, Any]], short: bool = False) -> List[str]:
+        lines: List[str] = []
+        if not ml_block:
+            return lines
+        try:
+            error = str(ml_block.get("error", "")).strip()
+        except Exception:
+            error = ""
+        if error:
+            lines.append(f"Diagnóstico ML no disponible: {error}")
+            return lines
+        try:
+            n_windows = int(ml_block.get("n_windows", 0) or 0)
+        except Exception:
+            n_windows = 0
+        if n_windows <= 0:
+            lines.append("Diagnóstico ML: sin suficientes datos para evaluar.")
+            return lines
+        try:
+            counts_raw = ml_block.get("counts") or {}
+            counts = {str(k): int(v) for k, v in counts_raw.items()}
+        except Exception:
+            counts = {}
+        raw_top = ml_block.get("top_prediction")
+        top_label = None
+        if raw_top is not None and str(raw_top).strip() != "":
+            top_label = str(raw_top)
+        top_count = counts.get(top_label, 0) if top_label else 0
+        if top_label:
+            if short:
+                lines.append(f"Diagnóstico ML: {top_label} ({top_count}/{n_windows} ventanas).")
+            else:
+                lines.append(f"Diagnóstico ML ({n_windows} ventanas): {top_label} ({top_count} ventanas).")
+        else:
+            lines.append(f"Diagnóstico ML evaluado en {n_windows} ventanas.")
+        if not short and counts:
+            for label, count in sorted(counts.items(), key=lambda item: (-item[1], str(item[0]))):
+                if label == top_label:
+                    continue
+                lines.append(f"- {label}: {count} ventanas.")
+        prob_val = None
+        try:
+            prob = ml_block.get("top_probability")
+            if prob is not None:
+                prob_val = float(prob)
+        except Exception:
+            prob_val = None
+        if prob_val is not None and prob_val >= 0.0:
+            lines.append(f"Confianza media (clase mayoritaria): {prob_val:.0%}.")
+        return lines
+
+    def _build_ml_table(self, ml_block: Optional[Dict[str, Any]], max_rows: int = 10):
+        if not ml_block:
+            return None
+        feature_rows = ml_block.get("feature_rows") or []
+        if not feature_rows:
+            return None
+        show_prob = any(row.get("prediction_probability") is not None for row in feature_rows)
+        columns = [
+            ft.DataColumn(ft.Text("#")),
+            ft.DataColumn(ft.Text("Rango (s)")),
+            ft.DataColumn(ft.Text("RMS vel (mm/s)")),
+            ft.DataColumn(ft.Text("Freq dom (Hz)")),
+            ft.DataColumn(ft.Text("Diagnóstico ML")),
+        ]
+        if show_prob:
+            columns.append(ft.DataColumn(ft.Text("Confianza")))
+
+        rows: List[ft.DataRow] = []
+        for idx, row in enumerate(feature_rows[:max_rows]):
+            raw_number = row.get("window_number") or row.get("window_index") or (idx + 1)
+            try:
+                number_text = str(int(raw_number))
+            except Exception:
+                number_text = str(idx + 1)
+            try:
+                start = float(row.get("window_start_s"))
+                end = float(row.get("window_end_s"))
+                range_text = f"{start:.2f} – {end:.2f}"
+            except Exception:
+                range_text = "-"
+            try:
+                rms_text = f"{float(row.get('rms_vel_mm_s', 0.0)):.3f}"
+            except Exception:
+                rms_text = "-"
+            try:
+                freq_text = f"{float(row.get('dom_freq_hz', 0.0)):.2f}"
+            except Exception:
+                freq_text = "-"
+            pred_text = str(row.get("prediction", "") or "-")
+            cells = [
+                ft.DataCell(ft.Text(number_text)),
+                ft.DataCell(ft.Text(range_text)),
+                ft.DataCell(ft.Text(rms_text)),
+                ft.DataCell(ft.Text(freq_text)),
+                ft.DataCell(ft.Text(pred_text)),
+            ]
+            if show_prob:
+                prob = row.get("prediction_probability")
+                try:
+                    prob_text = f"{float(prob) * 100.0:.1f}%"
+                except Exception:
+                    prob_text = "-"
+                cells.append(ft.DataCell(ft.Text(prob_text)))
+            rows.append(ft.DataRow(cells=cells))
+        if not rows:
+            return None
+        heading_color = ft.Colors.with_opacity(0.05, self._accent_ui())
+        return ft.DataTable(
+            columns=columns,
+            rows=rows,
+            column_spacing=14,
+            heading_row_color=heading_color,
+        )
+
+
     def _build_explanations(self, res: Dict[str, Any], findings: List[str]) -> List[str]:
         """
         Genera una lista de líneas de "Explicación y recomendaciones" basadas en:
@@ -5521,6 +5997,10 @@ class MainApp:
             lines.append(f"Distribución de energía: baja {fl:.0%}, media {fm:.0%}, alta {fh:.0%}.")
         except Exception:
             pass
+
+        ml_lines = self._ml_summary_lines(res.get('ml'))
+        if ml_lines:
+            lines.extend(ml_lines)
 
         # Helper para buscar presencia robusta (variantes de acentos/codificación)
         def _has_any(keys: List[str]) -> bool:
@@ -6533,6 +7013,8 @@ class MainApp:
                     aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
                     plt.close(aux_fig)
 
+
+
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
                 sev_label, sev_color = severity_label_ms, severity_color_ms
@@ -6542,18 +7024,27 @@ class MainApp:
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
+            ml_block = res.get('ml') or {}
+            ml_summary_short = self._ml_summary_lines(ml_block, short=True)
+            ml_summary_full = self._ml_summary_lines(ml_block)
+            ml_table = self._build_ml_table(ml_block, max_rows=8)
+
+            resumen_exec_controls: List[ft.Control] = [
+                ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
+                ft.Row([
+                    ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
+                    ft.Text(f"Clasificación ISO: {sev_label}")
+                ]),
+                ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text("Diagnóstico:"),
+            ]
+            resumen_exec_controls.extend(ft.Text(f"- {it}") for it in exec_findings)
+            if ml_summary_short:
+                resumen_exec_controls.append(ft.Text("Diagnóstico ML:"))
+                resumen_exec_controls.extend(ft.Text(f"- {line}") for line in ml_summary_short)
             resumen_exec = ft.Container(
-                content=ft.Column([
-                    ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
-                    ft.Row([
-                        ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
-                        ft.Text(f"Clasificación ISO: {sev_label}")
-                    ]),
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                    ft.Text("Diagnóstico:"),
-                    *[ft.Text(f"- {it}") for it in exec_findings],
-                ], spacing=6),
+                content=ft.Column(controls=resumen_exec_controls, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
                 border_radius=10,
                 padding=10
@@ -6561,40 +7052,31 @@ class MainApp:
 
             # --- Panel resumen + diagnóstico ---
 
+            resumen_controls: List[ft.Control] = [
+                ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
+                ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                ft.Text(
+                    f"Crest factor (aceleración): "
+                    f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                ),
+                ft.Divider(),
+                ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
+            ]
+            resumen_controls.extend(ft.Text(f"• {it}") for it in findings)
+            if ml_summary_full:
+                resumen_controls.append(ft.Divider())
+                resumen_controls.append(ft.Text("🤖 Diagnóstico asistido por ML", size=16, weight="bold"))
+                resumen_controls.extend(ft.Text(f"• {line}") for line in ml_summary_full)
+            if ml_table:
+                resumen_controls.append(ml_table)
             resumen = ft.Container(
-
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
-
+                content=ft.Column(controls=resumen_controls, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
                 border_radius=10,
-
-                padding=10
-
+                padding=10,
             )
-
-
 
             # Nota de filtro visual FFT para mayor precisión en la interpretación
             try:
@@ -6623,18 +7105,19 @@ class MainApp:
 
                     controls=[
                         resumen_exec,
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                            *[ft.Text(f"- {it}") for it in exp_lines],
-                        ], spacing=6),
-                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                        border_radius=10,
-                        padding=10,
-                    ),
-                    ft.Text(_fft_filter_note),
-                    chart
-                ]
+                        resumen,
+                        ft.Container(
+                            content=ft.Column([
+                                ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
+                                *[ft.Text(f"- {it}") for it in exp_lines],
+                            ], spacing=6),
+                            bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+                            border_radius=10,
+                            padding=10,
+                        ),
+                        ft.Text(_fft_filter_note),
+                        chart,
+                    ]
                     + ([runup_chart] if runup_chart else [])
                     + ([orbit_chart] if orbit_chart else [])
                     + ([env_chart] if 'env_chart' in locals() and env_chart else [])
