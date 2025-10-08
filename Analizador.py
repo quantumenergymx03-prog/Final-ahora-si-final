@@ -30,6 +30,7 @@ from reportlab.platypus import (
     PageBreak,
     ListFlowable,
     ListItem,
+    HRFlowable,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
@@ -2137,6 +2138,7 @@ class MainApp:
 
     def exportar_pdf(self, e=None):
         prev_style = plt.rcParams.copy()
+        tmp_imgs: List[str] = []
         try:
             if self.current_df is None or getattr(self.current_df, 'empty', False):
                 self._log("No hay datos para exportar")
@@ -2188,9 +2190,9 @@ class MainApp:
                 return xf, mag_vel_mm, mag_vel
 
             xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
-            rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
-            rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
-            severity_mm = self._classify_severity(rms_mm)
+            rms_mm = 0.0
+            rms_ms = 0.0
+            severity_mm = "N/D"
 
             if xf is not None:
                 features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm)
@@ -2326,7 +2328,7 @@ class MainApp:
 
             fig1, ax1 = plt.subplots(figsize=(8, 3))
             if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+                ax1.plot(t_seg, sig_seg, color=accent_color, linewidth=1.6)
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
@@ -2383,7 +2385,7 @@ class MainApp:
                 if xpdf.size == 0:
                     xpdf = xf
                     ypdf = mag_vel_mm
-                ax2.plot(xpdf, ypdf, color=self.fft_plot_color, linewidth=1.6)
+                ax2.plot(xpdf, ypdf, color=accent_color, linewidth=1.6)
                 try:
                     K = 5
                     min_freq = (max(0.5, fc) if hide_lf else 0.5)
@@ -2398,7 +2400,7 @@ class MainApp:
                         idx = idx[np.argsort(yv[idx])[::-1]]
                         peak_f = xv[idx]
                         peak_a = yv[idx]
-                        ax2.scatter(peak_f, peak_a, color="#e74c3c", s=20, zorder=5)
+                        ax2.scatter(peak_f, peak_a, color="#8c3f5d", s=20, zorder=5)
                         f1 = self._get_1x_hz(features_full.get("dom_freq", 0.0))
                         peak_points: List[Tuple[float, float]] = []
                         peak_labels: List[str] = []
@@ -2418,7 +2420,7 @@ class MainApp:
                             peak_points.append((pf_f, pa_f))
                             peak_labels.append(self._format_peak_label(pf_f, pa_f, order))
                         if peak_points:
-                            self._place_annotations(ax2, peak_points, peak_labels, color="#e74c3c")
+                            self._place_annotations(ax2, peak_points, peak_labels, color="#8c3f5d")
                 except Exception:
                     pass
                 try:
@@ -2427,10 +2429,10 @@ class MainApp:
                     bsf  = self._fldf(getattr(self, 'bsf_field', None))
                     ftf  = self._fldf(getattr(self, 'ftf_field', None))
                     marks_raw = [
-                        (bpfo, 'BPFO', '#1f77b4'),
-                        (bpfi, 'BPFI', '#ff7f0e'),
-                        (bsf,  'BSF',  '#2ca02c'),
-                        (ftf,  'FTF',  '#9467bd'),
+                        (bpfo, 'BPFO', '#4b5563'),
+                        (bpfi, 'BPFI', '#6b7280'),
+                        (bsf,  'BSF',  '#9ca3af'),
+                        (ftf,  'FTF',  '#d1d5db'),
                     ]
                     visible_marks = []
                     for f0, label, col in marks_raw:
@@ -2481,7 +2483,7 @@ class MainApp:
                     xenv = xf_env[m_env]
                     yenv = env_amp[m_env]
                     env_fig, env_ax = plt.subplots(figsize=(8, 3))
-                    env_ax.plot(xenv, yenv, color="#e67e22", linewidth=1.6)
+                    env_ax.plot(xenv, yenv, color=accent_color, linewidth=1.6)
                     env_ax.set_title("Espectro de Envolvente")
                     env_ax.set_xlabel("Frecuencia (Hz)")
                     env_ax.set_ylabel("Amp [a.u.]")
@@ -2508,10 +2510,10 @@ class MainApp:
                                     filtered = tmp
                             env_visible_peaks = [(float(f0), float(a0), float(snr)) for f0, a0, snr in filtered]
                             pfx, pfy = zip(*[(f0, a0) for f0, a0, _ in env_visible_peaks])
-                            env_ax.scatter(pfx, pfy, color="#c0392b", s=36, zorder=5, edgecolors="white", linewidths=0.6)
+                            env_ax.scatter(pfx, pfy, color="#8c3f5d", s=36, zorder=5, edgecolors="white", linewidths=0.6)
                             peak_points = [(f0, a0) for f0, a0, _ in env_visible_peaks]
                             peak_labels = [f"{f0:.2f} Hz | {a0:.3f} a.u." for f0, a0, _ in env_visible_peaks]
-                            self._place_annotations(env_ax, peak_points, peak_labels, color="#c0392b", text_color="#c0392b")
+                            self._place_annotations(env_ax, peak_points, peak_labels, color="#8c3f5d", text_color="#8c3f5d")
                     except Exception:
                         pass
                     try:
@@ -2623,45 +2625,83 @@ class MainApp:
 
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
             styles = getSampleStyleSheet()
-            try:
-                accent_hex = self._accent_hex()
-            except Exception:
-                accent_hex = "#1f77b4"
-            try:
-                accent_color = colors.HexColor(accent_hex)
-            except Exception:
-                accent_color = colors.HexColor("#1f77b4")
-            title_style = ParagraphStyle(
-                "title",
-                parent=styles['Title'],
-                textColor=accent_color,
-                spaceAfter=12,
-            )
-            styles.add(
-                ParagraphStyle(
-                    "HeadingAccent",
-                    parent=styles['Heading1'],
-                    textColor=accent_color,
-                    spaceAfter=8,
+            accent_color = colors.HexColor("#1f2933")
+            muted_color = colors.HexColor("#4b5563")
+            border_color = colors.HexColor("#d1d5db")
+            light_bg = colors.HexColor("#f4f6f8")
+
+            style_map = getattr(styles, "byName", {})
+            if "ReportTitle" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "ReportTitle",
+                        parent=styles['Title'],
+                        textColor=accent_color,
+                        fontName="Helvetica-Bold",
+                        fontSize=18,
+                        leading=22,
+                        spaceAfter=6,
+                    )
                 )
-            )
-            styles.add(
-                ParagraphStyle(
-                    "SectionHeading",
-                    parent=styles['Heading2'],
-                    textColor=accent_color,
-                    spaceBefore=12,
-                    spaceAfter=6,
+            if "HeadingAccent" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "HeadingAccent",
+                        parent=styles['Heading1'],
+                        textColor=accent_color,
+                        fontName="Helvetica-Bold",
+                        fontSize=14,
+                        leading=18,
+                        spaceAfter=6,
+                    )
                 )
-            )
-            styles.add(
-                ParagraphStyle(
-                    "BulletItem",
-                    parent=styles['Normal'],
-                    leftIndent=18,
-                    spaceAfter=4,
+            if "SectionHeading" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "SectionHeading",
+                        parent=styles['Heading2'],
+                        textColor=accent_color,
+                        fontName="Helvetica-Bold",
+                        fontSize=12,
+                        leading=16,
+                        spaceBefore=14,
+                        spaceAfter=6,
+                    )
                 )
-            )
+            if "Subheading" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "Subheading",
+                        parent=styles['Heading3'],
+                        textColor=accent_color,
+                        fontName="Helvetica-Bold",
+                        fontSize=11,
+                        leading=14,
+                        spaceBefore=10,
+                        spaceAfter=4,
+                    )
+                )
+            if "BulletItem" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "BulletItem",
+                        parent=styles['Normal'],
+                        leftIndent=16,
+                        spaceAfter=3,
+                    )
+                )
+            if "Muted" not in style_map:
+                styles.add(
+                    ParagraphStyle(
+                        "Muted",
+                        parent=styles['Normal'],
+                        textColor=muted_color,
+                        fontSize=9,
+                        leading=12,
+                    )
+                )
+
+            title_style = styles['ReportTitle']
 
             def _apply_table_style(tbl: Table) -> None:
                 tbl.setStyle(
@@ -2671,12 +2711,39 @@ class MainApp:
                             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                             ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
                             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [light_bg, colors.white]),
                             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                            ("GRID", (0, 0), (-1, -1), 0.4, border_color),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                         ]
                     )
                 )
+
+            def _hr(space_before: float = 8, space_after: float = 8) -> HRFlowable:
+                return HRFlowable(
+                    width="100%",
+                    thickness=1,
+                    color=border_color,
+                    spaceBefore=space_before,
+                    spaceAfter=space_after,
+                )
+
+            def _sanitize_text(text: Optional[str]) -> str:
+                if text is None:
+                    return ""
+                cleaned = str(text)
+                for token in ("✅", "⚠️", "❌", "🔥"):
+                    cleaned = cleaned.replace(token, "")
+                return " ".join(cleaned.strip().split())
+
+            severity_clean = _sanitize_text(severity_mm)
+            severity_entry_clean = _sanitize_text(severity_entry_pdf)
+            exec_findings_all = list(findings_core_pdf)
+            exec_findings = self._select_main_findings(exec_findings_all)
+            if not exec_findings:
+                exec_findings = ["Sin anomalías evidentes según reglas actuales."]
+            exec_findings_clean = [_sanitize_text(text) for text in exec_findings]
 
             elements = []
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
@@ -2690,13 +2757,13 @@ class MainApp:
             cover_summary = [
                 ["Indicador", "Valor"],
                 ["RMS velocidad", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
+                ["Clasificacion ISO", severity_clean or "N/D"],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
             _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
-            elements.append(PageBreak())
+            elements.append(_hr(space_before=16, space_after=12))
 
             # Nota filtro visual (export): obtiene estado actual de la UI
             try:
@@ -2710,15 +2777,35 @@ class MainApp:
             _pdf_fft_filter_note = f"Filtro visual FFT: oculta < {_pdf_fc:.2f} Hz" if _pdf_hide_lf else "Filtro visual FFT: sin ocultar"
 
             elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
-            exec_findings_all = list(findings_core_pdf)
-            exec_findings = self._select_main_findings(exec_findings_all)
-            if not exec_findings:
-                exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
-            elements.append(Paragraph(f"Clasificacion ISO: {severity_mm}", styles['Normal']))
-            elements.append(Paragraph(f"RMS velocidad: {rms_mm:.3f} mm/s", styles['Normal']))
-            elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
-            elements.append(Paragraph(_pdf_fft_filter_note, styles['Normal']))
+            summary_exec = [
+                ["Indicador", "Detalle"],
+                ["Clasificación ISO", severity_clean or "N/D"],
+                ["RMS velocidad (mm/s)", f"{rms_mm:.3f}"],
+                ["Frecuencia dominante (Hz)", f"{features_full['dom_freq']:.2f}"],
+                ["Filtro FFT", _pdf_fft_filter_note],
+            ]
+            summary_exec_table = Table(summary_exec, colWidths=[190, 210])
+            _apply_table_style(summary_exec_table)
+            elements.append(summary_exec_table)
             elements.append(Spacer(1, 8))
+
+            elements.append(Paragraph("Hallazgos principales", styles['Subheading']))
+            findings_bullets = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in exec_findings_clean
+            ]
+            elements.append(
+                ListFlowable(
+                    findings_bullets,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
+            if severity_entry_clean and severity_entry_clean not in exec_findings_clean:
+                elements.append(Paragraph(severity_entry_clean, styles['Muted']))
+            elements.append(Spacer(1, 10))
             # Semáforo de severidad (actual + otros atenuados)
             try:
                 # Mapear label a índice
@@ -2733,13 +2820,12 @@ class MainApp:
                     if "inaceptable" in s:
                         return 3
                     return -1
-                cur_idx = _sev_index(severity_mm)
-                # Colores base
+                cur_idx = _sev_index(severity_clean)
                 base = [
-                    ("Buena", "#2ecc71"),
-                    ("Satisfactoria", "#f1c40f"),
-                    ("Insatisfactoria", "#e67e22"),
-                    ("Inaceptable", "#e74c3c"),
+                    ("Buena", "#2f855a"),
+                    ("Satisfactoria", "#b7791f"),
+                    ("Insatisfactoria", "#c05621"),
+                    ("Inaceptable", "#c53030"),
                 ]
                 # Helper para aclarar colores
                 def _lighten_hex(hx: str, f: float):
@@ -2766,38 +2852,46 @@ class MainApp:
                     else:
                         bg = _lighten_hex(hx, 0.65)
                     ts.append(("BACKGROUND", (i, 0), (i, 0), bg))
-                    ts.append(("BOX", (i, 0), (i, 0), 0.5, colors.black))
+                    ts.append(("BOX", (i, 0), (i, 0), 0.5, border_color))
                     ts.append(("ALIGN", (i, 0), (i, 0), "CENTER"))
                     ts.append(("ALIGN", (i, 1), (i, 1), "CENTER"))
-                ts.append(("GRID", (0, 1), (-1, 1), 0.25, colors.grey))
+                ts.append(("GRID", (0, 1), (-1, 1), 0.4, border_color))
                 sem_tbl.setStyle(TableStyle(ts))
-                elements.append(Paragraph("Semáforo de severidad", styles['Heading2']))
+                elements.append(Paragraph("Semáforo de severidad", styles['Subheading']))
                 elements.append(sem_tbl)
                 elements.append(Spacer(1, 12))
             except Exception:
                 pass
-            # Omitir bloque duplicado de diagnostico para evitar repeticion
-            # elements.append(Paragraph("Diagnostico:", styles['Heading2']))
-            for item in []:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
-
-            # Explicacion y recomendaciones (PDF)
-            # Explicación y recomendaciones (unificadas con la app)
             exp_lines_pdf2 = self._build_explanations(res, exec_findings)
-            elements.append(Paragraph("Explicacion y recomendaciones", styles['Heading2']))
-            for line in exp_lines_pdf2:
-                elements.append(Paragraph(f"- {line}", styles['Normal']))
+            exp_lines_pdf2_clean = [_sanitize_text(line) for line in exp_lines_pdf2 if line]
+            if exp_lines_pdf2_clean:
+                elements.append(Paragraph("Explicación y recomendaciones", styles['Subheading']))
+                rec_bullets = [
+                    ListItem(Paragraph(line, styles['Normal']), bulletColor=accent_color)
+                    for line in exp_lines_pdf2_clean
+                ]
+                elements.append(
+                    ListFlowable(
+                        rec_bullets,
+                        bulletType='bullet',
+                        bulletColor=accent_color,
+                        start='bulletchar',
+                        leftIndent=16,
+                    )
+                )
+            elements.append(_hr(space_before=14, space_after=12))
 
             
 
-            elements.append(Paragraph("Reporte de Análisis de Vibraciones", title_style))
-            elements.append(Paragraph(f"Archivo: {base_name}", styles['Normal']))
-            elements.append(Paragraph(f"Periodo: {start_t:.2f}s - {end_t:.2f}s", styles['Normal']))
-            elements.append(Spacer(1, 12))
+            elements.append(PageBreak())
+            elements.append(Paragraph("Detalles del análisis", styles['HeadingAccent']))
+            elements.append(Paragraph(f"Archivo: {base_name}", styles['Muted']))
+            elements.append(Paragraph(f"Segmento: {start_t:.2f}s – {end_t:.2f}s", styles['Muted']))
+            elements.append(Spacer(1, 10))
 
             # Top picos (FFT)
             if top_peaks:
-                elements.append(Paragraph("Picos principales (FFT)", styles['Heading2']))
+                elements.append(Paragraph("Picos principales (FFT)", styles['Subheading']))
                 peaks_data = [["Frecuencia (Hz)", "Amplitud (mm/s)", "Orden (X)"]]
                 for pf, pa, order in top_peaks:
                     peaks_data.append([f"{pf:.2f}", f"{pa:.3f}", f"{order:.2f}" if order else "-"])
@@ -2807,23 +2901,25 @@ class MainApp:
                 elements.append(Spacer(1, 12))
 
             data_summary = [
-                ["Metrica", "Valor"],
+                ["Métrica", "Valor"],
                 ["RMS (velocidad)", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
+                ["Clasificación ISO", severity_clean or "N/D"],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             table_summary = Table(data_summary, colWidths=[200, 200])
             _apply_table_style(table_summary)
             elements.append(table_summary)
-            elements.append(Spacer(1, 12))
+            elements.append(_hr(space_before=12, space_after=10))
 
+            elements.append(Paragraph("Señales principales", styles['Subheading']))
             elements.append(Image(img_time, width=400, height=150))
+            elements.append(Spacer(1, 8))
             elements.append(Image(img_fft, width=400, height=150))
             if img_env:
                 elements.append(Image(img_env, width=400, height=150))
                 if env_visible_peaks:
                     elements.append(Spacer(1, 8))
-                    elements.append(Paragraph("Picos principales (envolvente)", styles['Heading2']))
+                    elements.append(Paragraph("Picos principales (envolvente)", styles['Subheading']))
                     env_table_data = [["Frecuencia (Hz)", "Amplitud (a.u.)", "SNR (dB)"]]
                     for f0, a0, snr in env_visible_peaks:
                         env_table_data.append([f"{f0:.2f}", f"{a0:.3f}", f"{snr:.1f}"])
@@ -2832,14 +2928,14 @@ class MainApp:
                     elements.append(env_table)
                     elements.append(Spacer(1, 12))
             if img_runup:
-                elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
+                elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Subheading']))
                 elements.append(Image(img_runup, width=400, height=180))
             if img_orbit:
-                elements.append(Paragraph("Análisis de órbita", styles['Heading2']))
+                elements.append(Paragraph("Análisis de órbita", styles['Subheading']))
                 elements.append(Image(img_orbit, width=320, height=320))
 
             if aux_imgs:
-                elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
+                elements.append(Paragraph("Variables auxiliares", styles['Subheading']))
                 for img in aux_imgs:
                     elements.append(Image(img, width=400, height=120))
                 aux_data = [["Variable", "Promedio", "Mínimo", "Máximo"]]
@@ -2853,17 +2949,18 @@ class MainApp:
                     _apply_table_style(aux_table)
                     elements.append(aux_table)
 
-            elements.append(Spacer(1, 12))
+            elements.append(_hr(space_before=12, space_after=10))
             elements.append(Paragraph("Diagnóstico", styles['SectionHeading']))
             elements.append(
                 Paragraph(
-                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.",
+                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_clean or 'N/D'}.",
                     styles['Normal'],
                 )
             )
-            if severity_entry_pdf and severity_entry_pdf not in findings_core_pdf:
-                elements.append(Paragraph(severity_entry_pdf, styles['Normal']))
-            diag_items = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            if severity_entry_clean and severity_entry_clean not in exec_findings_clean:
+                elements.append(Paragraph(severity_entry_clean, styles['Muted']))
+            diag_items_raw = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            diag_items = [_sanitize_text(text) for text in diag_items_raw]
             bullet_items = [
                 ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
                 for text in diag_items
@@ -2919,7 +3016,7 @@ class MainApp:
                 props = [[k, v] for k, v in props if str(v) != '']
                 if props:
                     elements.append(Spacer(1, 12))
-                    elements.append(Paragraph("Propiedades del equipo", styles['Heading2']))
+                    elements.append(Paragraph("Propiedades del equipo", styles['Subheading']))
                     tbl_props = Table([["Propiedad", "Valor"]] + props, colWidths=[200, 200])
                     _apply_table_style(tbl_props)
                     elements.append(tbl_props)
@@ -2953,6 +3050,12 @@ class MainApp:
                 plt.rcParams.update(prev_style)
             except Exception:
                 pass
+            for _img in tmp_imgs:
+                try:
+                    if _img and os.path.exists(_img):
+                        os.remove(_img)
+                except Exception:
+                    pass
 
 
 
@@ -3783,9 +3886,9 @@ class MainApp:
                 return xf, mag_vel_mm, mag_vel
 
             xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
-            rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
-            rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
-            severity_mm = self._classify_severity(rms_mm)
+            rms_mm = 0.0
+            rms_ms = 0.0
+            severity_mm = "N/D"
             severity_label_ms, severity_color_ms = self._classify_severity_ms(rms_ms)
 
             # --- Features + diagnóstico para el PDF (usa mm/s) ---
@@ -6148,7 +6251,7 @@ class MainApp:
                     eps = 1e-12
                     yplot_dbv = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
                     ax2_db = ax2.twinx()
-                    ax2_db.plot(xplot, yplot_dbv, color="#9b59b6", linewidth=1.6, linestyle="--")
+                    ax2_db.plot(xplot, yplot_dbv, color="#6b7280", linewidth=1.4, linestyle="--")
                     ax2_db.set_ylabel("Nivel [dBV]")
                     # Aplicar rango Y si se definió
                     try:
