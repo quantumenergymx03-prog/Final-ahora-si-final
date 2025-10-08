@@ -7,6 +7,7 @@ from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
 import matplotlib
+import re
 matplotlib.use("Agg")
 # Matplotlib font configuration to avoid missing glyphs in SVG (e.g., Arial)
 import matplotlib as mpl
@@ -16,6 +17,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
+import unicodedata
 from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
@@ -143,6 +145,46 @@ CHARLOTTE_MOTOR_FAULTS: List[Dict[str, str]] = [
         "description": "Picos a frecuencias de aspas/paletas y subarmónicos modulados.",
     },
 ]
+
+
+def _resolve_fft_window(window_name: Optional[str]) -> str:
+    """Normaliza el nombre de ventana FFT a un identificador soportado."""
+
+    try:
+        name = str(window_name or "").strip().lower()
+    except Exception:
+        name = ""
+    if name in {"flat-top", "flat_top", "flat top", "flattop"}:
+        return "flattop"
+    return "hann"
+
+
+def _build_fft_window(window_name: Optional[str], n: int) -> Tuple[np.ndarray, float]:
+    """Genera la ventana solicitada y su ganancia coherente (media)."""
+
+    if n <= 0:
+        return np.zeros(0, dtype=float), 1.0
+    if n == 1:
+        return np.ones(1, dtype=float), 1.0
+    name = _resolve_fft_window(window_name)
+    if name == "flattop":
+        k = np.arange(n, dtype=float)
+        denom = float(n - 1) if n > 1 else 1.0
+        angle = 2.0 * np.pi * k / denom
+        window = (
+            1.0
+            - 1.93 * np.cos(angle)
+            + 1.29 * np.cos(2.0 * angle)
+            - 0.388 * np.cos(3.0 * angle)
+            + 0.0322 * np.cos(4.0 * angle)
+        )
+    else:
+        window = np.hanning(n)
+    window = np.asarray(window, dtype=float)
+    cg = float(np.mean(window)) if np.any(window) else 1.0
+    if not np.isfinite(cg) or abs(cg) < 1e-12:
+        cg = 1.0
+    return window, cg
 
 
 def _charlotte_faults_lines() -> List[str]:
@@ -409,6 +451,43 @@ def anti_alias_and_decimate(time_s: np.ndarray,
     # Banda del FIR en fs_in: paso hasta f_max, rechazo a 0.9*Nyquist de fs_out (colchón)
     f_pass = min(f_max_hz, 0.9 * nyq_out)
     f_stop = 0.95 * nyq_out
+
+    delta_f = max(1e-9, f_stop - f_pass)
+    d_omega = 2.0 * np.pi * (delta_f / fs_in)
+    est_numtaps = int(np.ceil((max(atten_db, 0.0) - 8.0) / (2.285 * d_omega))) + 1
+    if est_numtaps % 2 == 0:
+        est_numtaps += 1
+    MAX_FIR_TAPS = 4095
+    if est_numtaps > MAX_FIR_TAPS or est_numtaps > y.size:
+        idx = np.arange(0, y.size, M)
+        if idx.size <= 1:
+            return t[::M], y[::M], fs_out, {
+                "M": int(M),
+                "numtaps": 1,
+                "fs_in": float(fs_in),
+                "fs_out": float(fs_out),
+                "f_pass_hz": float(f_pass),
+                "f_stop_hz": float(f_stop),
+                "atten_db": float(atten_db),
+                "note": "decimación directa (FIR omitido por límite de taps)",
+            }
+        seg_lengths = np.minimum(M, y.size - idx).astype(float)
+        sum_y = np.add.reduceat(y, idx)
+        sum_t = np.add.reduceat(t, idx)
+        x_dec = (sum_y / seg_lengths).astype(float)
+        t_dec = (sum_t / seg_lengths).astype(float)
+        info = {
+            "M": int(M),
+            "numtaps": int(min(est_numtaps, MAX_FIR_TAPS)),
+            "fs_in": float(fs_in),
+            "fs_out": float(fs_out),
+            "f_pass_hz": float(f_pass),
+            "f_stop_hz": float(f_stop),
+            "atten_db": float(atten_db),
+            "note": "decimación simplificada (promedio por bloques)",
+        }
+        return t_dec, x_dec, fs_out, info
+
     h = design_kaiser_lowpass(fs_in, f_pass, f_stop, atten_db=atten_db)
     gd = (len(h) - 1) // 2
 
@@ -463,6 +542,7 @@ def analyze_vibration(
     min_bins: int = 2,
     min_snr_db: float = 6.0,
     top_k_peaks: int = 5,
+    fft_window: str = "hann",
 ) -> Dict[str, Any]:
     def _to_1d(x: np.ndarray) -> np.ndarray:
         x = np.asarray(x).astype(float).ravel()
@@ -487,6 +567,8 @@ def analyze_vibration(
         dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.0
         fs = 1.0 / dt if dt > 0 else 0.0
         return fs, dt
+    window_type = _resolve_fft_window(fft_window)
+
     def _acc_fft_to_vel_mm_s(y: np.ndarray, dt: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """
         Calcula espectro de aceleración y velocidad (mm/s) usando rFFT con ventana Hann
@@ -498,9 +580,13 @@ def analyze_vibration(
         if N < 2 or dt <= 0:
             return np.array([]), np.array([]), np.array([]), 0.0
 
-        # Espectro para visualización (ventana Hann + corrección de ganancia)
-        w = np.hanning(N)
-        cg = w.mean() if w.mean() != 0 else 1.0
+        # Espectro para visualización (ventana seleccionada + corrección de ganancia)
+        w, cg = _build_fft_window(window_type, N)
+        if w.size != N:
+            w = np.hanning(N)
+            cg = float(np.mean(w)) if np.any(w) else 1.0
+            if not np.isfinite(cg) or abs(cg) < 1e-12:
+                cg = 1.0
         Yw = np.fft.rfft(y * w)
         xf = np.fft.rfftfreq(N, dt)
 
@@ -654,16 +740,27 @@ def analyze_vibration(
     peak_acc = float(np.max(np.abs(a))) if len(a) else 0.0
     pp_acc = float(np.ptp(a)) if len(a) else 0.0
     if len(mag_vel_mm) > 0:
-        # Dominante ignorando muy baja frecuencia para evitar sesgos visuales
+        # Dominante ignorando muy baja frecuencia para evitar sesgos por DC
         dom_min_hz = 0.5
-        mask_dom = xf >= dom_min_hz
-        if np.any(mask_dom):
-            rel_idx = int(np.argmax(mag_vel_mm[mask_dom]))
-            idx_dom = np.where(mask_dom)[0][rel_idx]
-        else:
-            idx_dom = int(np.argmax(mag_vel_mm))
-        dom_freq = float(xf[idx_dom])
-        dom_amp = float(mag_vel_mm[idx_dom])
+        mag_for_dom = mag_vel_mm.copy()
+        try:
+            if len(xf) == len(mag_for_dom):
+                mag_for_dom[xf < dom_min_hz] = 0.0
+        except Exception:
+            pass
+        idx_dom = int(np.argmax(mag_for_dom)) if len(mag_for_dom) else 0
+        dom_freq = float(xf[idx_dom]) if len(xf) > idx_dom else 0.0
+        dom_amp = float(mag_vel_mm[idx_dom]) if len(mag_vel_mm) > idx_dom else 0.0
+        if (dom_freq <= 0.0) and np.any(xf >= dom_min_hz):
+            try:
+                candidates = np.where(xf >= dom_min_hz)[0]
+                if candidates.size:
+                    best_idx = candidates[int(np.argmax(mag_vel_mm[candidates]))]
+                    dom_freq = float(xf[best_idx])
+                    dom_amp = float(mag_vel_mm[best_idx])
+                    idx_dom = int(best_idx)
+            except Exception:
+                pass
     else:
         dom_freq, dom_amp = 0.0, 0.0
     # Severidad basada en RMS de velocidad temporal (mm/s)
@@ -859,9 +956,11 @@ def analyze_vibration(
             "peaks": peaks_fft,
             "dom_freq_hz": dom_freq,
             "dom_amp_mm_s": dom_amp,
+            "rms_vel_mm_s": rms_vel_spec_mm,
             "r2x": r2x,
             "r3x": r3x,
             "energy": {"low": e_low, "mid": e_mid, "high": e_high, "total": e_total},
+            "window": window_type,
         },
         "envelope": {
             "f_hz": xf_env,
@@ -1041,6 +1140,26 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        try:
+            stored_fft_window = self.page.client_storage.get("fft_window_type")
+        except Exception:
+            stored_fft_window = None
+        self.fft_window_type = _resolve_fft_window(stored_fft_window)
+        try:
+            stored_input_unit = self.page.client_storage.get("input_signal_unit")
+        except Exception:
+            stored_input_unit = None
+        valid_input_units = {
+            "acc_ms2",
+            "acc_g",
+            "vel_ms",
+            "vel_mm",
+            "vel_ips",
+            "disp_m",
+            "disp_mm",
+            "disp_um",
+        }
+        self.input_signal_unit = stored_input_unit if stored_input_unit in valid_input_units else "acc_ms2"
 
 
 
@@ -1063,9 +1182,14 @@ class MainApp:
         self.current_df = None
 
         self.file_data_storage = {}  # Almacenar datos de archivos
+        self.signal_unit_map: Dict[str, str] = {}
+        self._last_axis_severity: List[Dict[str, Any]] = []
+        self._last_primary_severity: Optional[Dict[str, Any]] = None
         self._fft_zoom_range: Optional[Tuple[float, float]] = None
         self._fft_full_range: Optional[Tuple[float, float]] = None
         self._fft_zoom_syncing = False
+        self._fft_display_scale: float = 1.0
+        self._fft_display_unit: str = "Hz"
 
         # Estado de análisis/rodamientos
         self.analysis_mode = 'auto'            # 'auto' o 'assist'
@@ -2022,6 +2146,268 @@ class MainApp:
         except Exception:
             return None
 
+    def _build_severity_traffic_light(self, rms_mm: float) -> ft.Container:
+        """Crea un semáforo visual según la severidad ISO."""
+
+        try:
+            rms_val = float(rms_mm)
+        except Exception:
+            rms_val = 0.0
+        if rms_val <= 2.8:
+            active_idx = 0
+        elif rms_val <= 4.5:
+            active_idx = 1
+        else:
+            active_idx = 2
+        colors = ["#2ecc71", "#f1c40f", "#e74c3c"]
+        labels = ["Zona A (Buena)", "Zona B (Vigilancia)", "Zona C/D (Alarma)"]
+
+        lights: List[ft.Control] = []
+        for idx, (color, label) in enumerate(zip(colors, labels)):
+            is_active = idx == active_idx
+            lights.append(
+                ft.Column(
+                    [
+                        ft.Container(
+                            width=26,
+                            height=26,
+                            bgcolor=color if is_active else ft.Colors.with_opacity(0.18, color),
+                            border=ft.border.all(2, color if is_active else ft.Colors.with_opacity(0.35, color)),
+                            border_radius=30,
+                        ),
+                        ft.Text(label, size=11, text_align=ft.TextAlign.CENTER, width=90),
+                    ],
+                    spacing=4,
+                    horizontal_alignment="center",
+                )
+            )
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Semáforo ISO", weight="bold", size=13),
+                    ft.Row(lights, alignment="spaceAround", expand=True),
+                ],
+                spacing=8,
+            ),
+            padding=ft.padding.all(10),
+            border_radius=10,
+            bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+        )
+
+    def _build_spectral_balance_widget(self, frac_low: float, frac_mid: float, frac_high: float) -> ft.Container:
+        """Visualiza la energía baja/media/alta en una barra apilada."""
+
+        safe_total = max(frac_low + frac_mid + frac_high, 1e-9)
+        portions = [
+            (max(frac_low / safe_total, 0.0), "Baja (0-30 Hz)", "#3498db"),
+            (max(frac_mid / safe_total, 0.0), "Media (30-120 Hz)", "#9b59b6"),
+            (max(frac_high / safe_total, 0.0), "Alta (>120 Hz)", "#e67e22"),
+        ]
+        bar_width = 260
+        segments: List[ft.Control] = []
+        for frac, _, color in portions:
+            width_px = max(2.0 if frac > 0 else 0.0, bar_width * frac)
+            segments.append(
+                ft.Container(
+                    width=width_px,
+                    height=14,
+                    bgcolor=color,
+                )
+            )
+        legend_items: List[ft.Control] = []
+        for frac, label, color in portions:
+            percent = max(min(frac * 100.0, 100.0), 0.0)
+            legend_items.append(
+                ft.Row(
+                    [
+                        ft.Container(width=10, height=10, bgcolor=color, border_radius=3),
+                        ft.Text(f"{label}: {percent:.1f}%", size=11),
+                    ],
+                    spacing=6,
+                    alignment="start",
+                )
+            )
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text("Balance espectral", weight="bold", size=13),
+                    ft.Container(
+                        content=ft.Row(segments, spacing=0, alignment="start"),
+                        width=bar_width,
+                        height=18,
+                        border_radius=6,
+                        bgcolor=ft.Colors.with_opacity(0.08, "#ffffff" if self.is_dark_mode else "#000000"),
+                        padding=ft.padding.symmetric(horizontal=2, vertical=2),
+                    ),
+                    ft.Column(legend_items, spacing=4, tight=True),
+                ],
+                spacing=8,
+            ),
+            padding=ft.padding.all(10),
+            border_radius=10,
+            bgcolor=ft.Colors.with_opacity(0.04, self._accent_ui()),
+        )
+
+    def _axis_letter_from_name(self, column: Any) -> Optional[str]:
+        name = str(column)
+        cl = name.lower()
+        if any(token in cl for token in ["ch1", "channel1", "axis x", " eje x"]):
+            return "X"
+        if any(token in cl for token in ["ch2", "channel2", "axis y", " eje y"]):
+            return "Y"
+        if any(token in cl for token in ["ch3", "channel3", "axis z", " eje z"]):
+            return "Z"
+        if ("acc" in cl) or ("acel" in cl):
+            if "x" in cl and "y" not in cl and "z" not in cl:
+                return "X"
+            if "y" in cl and "x" not in cl and "z" not in cl:
+                return "Y"
+            if "z" in cl and "x" not in cl and "y" not in cl:
+                return "Z"
+        if re.search(r"[_\-\s]x(?![a-z0-9])", cl) or cl.endswith("x"):
+            return "X"
+        if re.search(r"[_\-\s]y(?![a-z0-9])", cl) or cl.endswith("y"):
+            return "Y"
+        if re.search(r"[_\-\s]z(?![a-z0-9])", cl) or cl.endswith("z"):
+            return "Z"
+        return None
+
+    def _axis_display_name(self, column: Any) -> str:
+        letter = self._axis_letter_from_name(column)
+        return f"Eje {letter}" if letter else str(column)
+
+    def _get_axis_columns(self, time_col: str) -> List[str]:
+        if self.current_df is None:
+            return []
+        axis_cols: List[str] = []
+        for col in self.current_df.columns:
+            if str(col) == str(time_col):
+                continue
+            unit = (self.signal_unit_map or {}).get(col)
+            if unit == "acc_ms2":
+                axis_cols.append(col)
+                continue
+            name = str(col).lower()
+            if ("acc" in name) or ("acel" in name) or self._axis_letter_from_name(col):
+                axis_cols.append(col)
+        return axis_cols
+
+    def _compute_axis_severity(
+        self,
+        time_col: str,
+        mask: np.ndarray,
+        rpm_val: Optional[float],
+        line_val: Optional[float],
+        teeth_val: Optional[int],
+        pre_decimate_hz: Optional[float],
+        bpfo_val: Optional[float],
+        bpfi_val: Optional[float],
+        bsf_val: Optional[float],
+        ftf_val: Optional[float],
+        env_lo: Optional[float],
+        env_hi: Optional[float],
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if self.current_df is None:
+            self._last_axis_severity = []
+            self._last_primary_severity = None
+            return [], None
+        try:
+            t_full = pd.to_numeric(self.current_df[time_col], errors="coerce").to_numpy(dtype=float)
+        except Exception:
+            self._last_axis_severity = []
+            self._last_primary_severity = None
+            return [], None
+        if mask.size != t_full.size:
+            mask = mask[: t_full.size]
+        t_segment_raw = t_full[mask]
+        axis_cols = [col for col in self._get_axis_columns(time_col) if col in self.current_df.columns]
+        axis_summaries: List[Dict[str, Any]] = []
+        rms_values: List[float] = []
+        for col in axis_cols:
+            try:
+                series = pd.to_numeric(self.current_df[col], errors="coerce")
+                values = series.to_numpy(dtype=float)
+            except Exception:
+                values = np.asarray(self.current_df[col], dtype=float)
+            if values.size != mask.size:
+                if values.size:
+                    values = values[: mask.size]
+                else:
+                    continue
+            seg_raw = values[mask]
+            try:
+                t_axis, acc_axis, _, _ = self._prepare_segment_for_analysis(t_segment_raw, seg_raw, col)
+            except Exception:
+                t_axis, acc_axis = np.asarray([]), np.asarray([])
+            if acc_axis.size < 2 or t_axis.size < 2:
+                entry = {
+                    "name": self._axis_display_name(col),
+                    "column": col,
+                    "rms_mm_s": 0.0,
+                    "iso_label": "Sin datos",
+                    "emoji_label": "Sin datos",
+                    "color": "#7f8c8d",
+                    "is_global": False,
+                }
+                axis_summaries.append(entry)
+                continue
+            try:
+                res_axis = analyze_vibration(
+                    t_axis,
+                    acc_axis,
+                    rpm=rpm_val,
+                    line_freq_hz=line_val,
+                    bpfo_hz=bpfo_val,
+                    bpfi_hz=bpfi_val,
+                    bsf_hz=bsf_val,
+                    ftf_hz=ftf_val,
+                    gear_teeth=teeth_val,
+                    pre_decimate_to_fmax_hz=pre_decimate_hz,
+                    env_bp_lo_hz=env_lo,
+                    env_bp_hi_hz=env_hi,
+                    fft_window=self.fft_window_type,
+                )
+                axis_rms = float(res_axis.get("severity", {}).get("rms_mm_s", 0.0))
+                iso_label = res_axis.get("severity", {}).get("label", "N/D")
+                color = res_axis.get("severity", {}).get("color", "#7f8c8d")
+            except Exception:
+                axis_rms = 0.0
+                iso_label = "N/D"
+                color = "#7f8c8d"
+            emoji_label = self._classify_severity(axis_rms)
+            entry = {
+                "name": self._axis_display_name(col),
+                "column": col,
+                "rms_mm_s": axis_rms,
+                "iso_label": iso_label,
+                "emoji_label": emoji_label,
+                "color": color,
+                "is_global": False,
+            }
+            axis_summaries.append(entry)
+            rms_values.append(axis_rms)
+        if rms_values:
+            # Calcular el RMS global como media cuadrática de los ejes evaluados
+            # evitando que ejecuciones previas influyan en el resultado.
+            global_rms = float(np.sqrt(np.mean(np.square(rms_values))))
+            global_label, global_color = self._classify_severity_ms(global_rms / 1000.0)
+            global_entry = {
+                "name": "Global",
+                "column": "global",
+                "rms_mm_s": global_rms,
+                "iso_label": global_label,
+                "emoji_label": self._classify_severity(global_rms),
+                "color": global_color,
+                "is_global": True,
+            }
+            axis_summaries.insert(0, global_entry)
+        primary = None
+        if axis_summaries:
+            primary = next((entry for entry in axis_summaries if entry.get("is_global")), axis_summaries[0])
+        self._last_axis_severity = axis_summaries
+        self._last_primary_severity = primary
+        return axis_summaries, primary
+
     # Helpers de lectura segura de campos
     def _fldf(self, fld):
         try:
@@ -2165,13 +2551,17 @@ class MainApp:
             t = self.current_df[time_col].to_numpy()
             signal = self.current_df[fft_signal_col].to_numpy()
 
-            try:
-                start_t = float(self.start_time_field.value) if getattr(self.start_time_field, "value", None) else t[0]
-                end_t = float(self.end_time_field.value) if getattr(self.end_time_field, "value", None) else t[-1]
-            except Exception:
-                start_t, end_t = t[0], t[-1]
-            mask = (t >= start_t) & (t <= end_t)
-            t_seg, sig_seg = t[mask], signal[mask]
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                self._log("Periodo seleccionado inválido; se utilizará el rango completo.")
+                mask = np.isfinite(np.asarray(t, dtype=float))
+                start_t = float(np.nanmin(t[mask])) if np.any(mask) else 0.0
+                end_t = float(np.nanmax(t[mask])) if np.any(mask) else 0.0
+            segment_idx = np.nonzero(mask)[0]
+            t_seg_raw = t[segment_idx]
+            sig_seg_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
             def compute_fft_dual(y, tv):
                 N = len(y)
@@ -2187,13 +2577,13 @@ class MainApp:
                 mag_vel_mm = mag_vel * 1000.0
                 return xf, mag_vel_mm, mag_vel
 
-            xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
+            xf, mag_vel_mm, mag_vel = compute_fft_dual(acc_seg, t_seg)
             rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
             rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
             severity_mm = self._classify_severity(rms_mm)
 
             if xf is not None:
-                features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm)
+                features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm)
             else:
                 features_full = {"dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                                  "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0}
@@ -2201,7 +2591,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = self._diagnose(features_full) if xf is not None else ["Sin espectro válido para diagnóstico."]
 
             # Unificar cálculo con analizador (RMS de velocidad correcto)
@@ -2225,89 +2615,77 @@ class MainApp:
                 _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
             except Exception:
                 _fmax_pre = None
+            bpfo_val = self._fldf(getattr(self, 'bpfo_field', None))
+            bpfi_val = self._fldf(getattr(self, 'bpfi_field', None))
+            bsf_val = self._fldf(getattr(self, 'bsf_field', None))
+            ftf_val = self._fldf(getattr(self, 'ftf_field', None))
+            env_lo_val = self._fldf(getattr(self, 'env_bp_lo_field', None))
+            env_hi_val = self._fldf(getattr(self, 'env_bp_hi_field', None))
             res = analyze_vibration(
                 t_seg,
-                sig_seg,
+                acc_seg,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
+                bpfo_hz=bpfo_val,
+                bpfi_hz=bpfi_val,
+                bsf_hz=bsf_val,
+                ftf_hz=ftf_val,
                 gear_teeth=teeth_val,
                 pre_decimate_to_fmax_hz=_fmax_pre,
-                env_bp_lo_hz=self._fldf(getattr(self, 'env_bp_lo_field', None)),
-                env_bp_hi_hz=self._fldf(getattr(self, 'env_bp_hi_field', None)),
+                env_bp_lo_hz=env_lo_val,
+                env_bp_hi_hz=env_hi_val,
+                fft_window=self.fft_window_type,
             )
             xf = res['fft']['f_hz']
             mag_vel_mm = res['fft']['vel_spec_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_mm = res['severity']['label']
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm) if xf is not None else {
+            selected_rms_mm = res['severity']['rms_mm_s']
+            selected_label = res['severity']['label']
+            selected_color = res['severity']['color']
+            axis_summaries_pdf, primary_entry_pdf = self._compute_axis_severity(
+                time_col,
+                mask,
+                rpm_val,
+                line_val,
+                teeth_val,
+                _fmax_pre,
+                bpfo_val,
+                bpfi_val,
+                bsf_val,
+                ftf_val,
+                env_lo_val,
+                env_hi_val,
+            )
+            if primary_entry_pdf is None:
+                primary_entry_pdf = {
+                    "name": self._axis_display_name(fft_signal_col),
+                    "column": fft_signal_col,
+                    "rms_mm_s": selected_rms_mm,
+                    "iso_label": selected_label,
+                    "emoji_label": self._classify_severity(selected_rms_mm),
+                    "color": selected_color,
+                    "is_global": False,
+                }
+                self._last_primary_severity = primary_entry_pdf
+                if not getattr(self, "_last_axis_severity", []):
+                    self._last_axis_severity = [primary_entry_pdf]
+            else:
+                self._last_primary_severity = primary_entry_pdf
+            primary_rms_mm_pdf = float(primary_entry_pdf.get("rms_mm_s", selected_rms_mm))
+            primary_label_pdf = primary_entry_pdf.get("iso_label", selected_label)
+            primary_color_pdf = primary_entry_pdf.get("color", selected_color)
+            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm) if xf is not None else {
                 "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
                 "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
             }
             try:
-                features_full["rms_vel_spec"] = float(rms_mm)
+                features_full["rms_vel_spec"] = float(primary_rms_mm_pdf)
             except Exception:
                 pass
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', []) if xf is not None else ["Sin espectro valido para diagnostico."]
-
-            # Recalcular con analizador unificado (RMS de velocidad correcto)
-            try:
-                rpm_val = None
-                if getattr(self, "rpm_hint_field", None) and getattr(self.rpm_hint_field, "value", ""):
-                    rpm_val = float(self.rpm_hint_field.value)
-            except Exception:
-                rpm_val = None
-            try:
-                line_val = float(self.line_freq_dd.value) if getattr(self, "line_freq_dd", None) and getattr(self.line_freq_dd, "value", "") else None
-            except Exception:
-                line_val = None
-            try:
-                teeth_val = int(self.gear_teeth_field.value) if getattr(self, "gear_teeth_field", None) and getattr(self.gear_teeth_field, "value", "") else None
-            except Exception:
-                teeth_val = None
-            # usando self._fldf para leer campos numéricos opcionales
-            try:
-                _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
-            except Exception:
-                _fmax_pre = None
-            res = analyze_vibration(
-                t_seg,
-                sig_seg,
-                rpm=rpm_val,
-                line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
-                gear_teeth=teeth_val,
-                pre_decimate_to_fmax_hz=_fmax_pre,
-                env_bp_lo_hz=self._fldf(getattr(self, 'env_bp_lo_field', None)),
-                env_bp_hi_hz=self._fldf(getattr(self, 'env_bp_hi_field', None)),
-            )
-            xf = res['fft']['f_hz']
-            mag_vel_mm = res['fft']['vel_spec_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_mm = res['severity']['label']
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm) if xf is not None else {
-                "dom_freq": 0.0, "crest": 0.0, "rms_time_acc": 0.0, "peak_acc": 0.0, "pp_acc": 0.0,
-                "e_low": 0.0, "e_mid": 0.0, "e_high": 0.0, "e_total": 1e-12, "r2x": 0.0, "r3x": 0.0
-            }
-            try:
-                features_full["rms_vel_spec"] = float(rms_mm)
-            except Exception:
-                pass
-            self._last_xf = xf
-            self._last_spec = mag_vel_mm
-            self._last_tseg = t_seg
-            self._last_accseg = sig_seg
-            findings_pdf = res.get('diagnosis', [])
             severity_entry_pdf = res.get('diagnosis_summary')
             findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
             if not findings_core_pdf and findings_pdf:
@@ -2315,6 +2693,38 @@ class MainApp:
             charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
             if not charlotte_catalog_pdf:
                 charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
+            severity_mm = self._classify_severity(primary_rms_mm_pdf)
+            rms_mm = primary_rms_mm_pdf
+            axis_table_rows: List[List[str]] = []
+            if axis_summaries_pdf:
+                axis_table_rows.append(["Canal", "RMS (mm/s)", "Clasificación ISO"])
+                for entry in axis_summaries_pdf:
+                    try:
+                        rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f}"
+                    except Exception:
+                        rms_txt = "N/D"
+                    axis_table_rows.append([
+                        entry.get("name", "Eje"),
+                        rms_txt,
+                        entry.get("iso_label", "N/D"),
+                    ])
+
+            try:
+                unit_mode = getattr(self.time_unit_dd, 'value', 'vel_mm')
+            except Exception:
+                unit_mode = 'vel_mm'
+            if unit_mode == 'vel_mm':
+                _y_time = self._acc_to_vel_time_mm(acc_seg, t_seg)
+                _ylabel = 'Velocidad [mm/s]'
+                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else 'RMS vel: 0.000 mm/s'
+            elif unit_mode == 'acc_g':
+                _y_time = acc_seg / 9.80665
+                _ylabel = 'Aceleración [g]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
+            else:
+                _y_time = acc_seg
+                _ylabel = 'Aceleración [m/s²]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
 
             tmp_imgs = []
             def save_plot(fig):
@@ -2325,22 +2735,11 @@ class MainApp:
                 return path
 
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            if len(t_seg) > 0 and len(_y_time) > 0:
+                ax1.plot(t_seg, _y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
-            except Exception:
-                pass
-
-            # Ajustar etiqueta de eje Y segun unidad seleccionada
-            try:
-                ax1.set_ylabel(_ylabel)
-            except Exception:
-                pass
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS conforme a la unidad seleccionada
             try:
@@ -2372,6 +2771,11 @@ class MainApp:
 
             top_peaks = []
             fig2, ax2 = plt.subplots(figsize=(8, 3))
+            freq_scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+            if not np.isfinite(freq_scale) or freq_scale <= 0:
+                freq_scale = 1.0
+            freq_unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
+
             if xf is not None and mag_vel_mm is not None:
                 mask_vis = np.ones_like(xf, dtype=bool)
                 if hide_lf:
@@ -2383,7 +2787,8 @@ class MainApp:
                 if xpdf.size == 0:
                     xpdf = xf
                     ypdf = mag_vel_mm
-                ax2.plot(xpdf, ypdf, color=self.fft_plot_color, linewidth=1.6)
+                xpdf_disp = np.asarray(xpdf, dtype=float) / freq_scale if xpdf is not None else xpdf
+                ax2.plot(xpdf_disp, ypdf, color=self.fft_plot_color, linewidth=1.6)
                 try:
                     K = 5
                     min_freq = (max(0.5, fc) if hide_lf else 0.5)
@@ -2398,7 +2803,7 @@ class MainApp:
                         idx = idx[np.argsort(yv[idx])[::-1]]
                         peak_f = xv[idx]
                         peak_a = yv[idx]
-                        ax2.scatter(peak_f, peak_a, color="#e74c3c", s=20, zorder=5)
+                        ax2.scatter(peak_f / freq_scale, peak_a, color="#e74c3c", s=20, zorder=5)
                         f1 = self._get_1x_hz(features_full.get("dom_freq", 0.0))
                         peak_points: List[Tuple[float, float]] = []
                         peak_labels: List[str] = []
@@ -2415,7 +2820,7 @@ class MainApp:
                                 except Exception:
                                     order = None
                             top_peaks.append((pf_f, pa_f, order))
-                            peak_points.append((pf_f, pa_f))
+                            peak_points.append((pf_f / freq_scale, pa_f))
                             peak_labels.append(self._format_peak_label(pf_f, pa_f, order))
                         if peak_points:
                             self._place_annotations(ax2, peak_points, peak_labels, color="#e74c3c")
@@ -2443,20 +2848,21 @@ class MainApp:
                         if zmin is not None and (f0_f < zmin or f0_f > zmax):
                             continue
                         try:
-                            ax2.axvline(f0_f, color=col, linestyle='--', alpha=0.8, linewidth=1.2)
+                            ax2.axvline(f0_f / freq_scale, color=col, linestyle='--', alpha=0.8, linewidth=1.2)
                         except Exception:
                             pass
-                        visible_marks.append((f0_f, label, col))
-                    self._draw_frequency_markers(ax2, visible_marks, None if zmin is None else (zmin, zmax))
+                        visible_marks.append((f0_f / freq_scale, label, col))
+                    zoom_scaled = None if zmin is None else (zmin / freq_scale, zmax / freq_scale)
+                    self._draw_frequency_markers(ax2, visible_marks, zoom_scaled)
                 except Exception:
                     pass
             ax2.set_title(f"FFT (Velocidad)")
-            ax2.set_xlabel("Frecuencia (Hz)")
+            ax2.set_xlabel(f"Frecuencia ({freq_unit})")
             ax2.set_ylabel("Velocidad [mm/s]")
             try:
                 ax2_rpm = ax2.twiny()
                 xmin, xmax = ax2.get_xlim()
-                ax2_rpm.set_xlim(xmin * 60.0, xmax * 60.0)
+                ax2_rpm.set_xlim(xmin * freq_scale * 60.0, xmax * freq_scale * 60.0)
                 ax2_rpm.set_xlabel("Frecuencia (RPM)")
             except Exception:
                 pass
@@ -2481,9 +2887,10 @@ class MainApp:
                     xenv = xf_env[m_env]
                     yenv = env_amp[m_env]
                     env_fig, env_ax = plt.subplots(figsize=(8, 3))
-                    env_ax.plot(xenv, yenv, color="#e67e22", linewidth=1.6)
+                    xenv_disp = np.asarray(xenv, dtype=float) / freq_scale if xenv is not None else xenv
+                    env_ax.plot(xenv_disp, yenv, color="#e67e22", linewidth=1.6)
                     env_ax.set_title("Espectro de Envolvente")
-                    env_ax.set_xlabel("Frecuencia (Hz)")
+                    env_ax.set_xlabel(f"Frecuencia ({freq_unit})")
                     env_ax.set_ylabel("Amp [a.u.]")
                     try:
                         vis_peaks: List[Tuple[float, float, float]] = []
@@ -2508,9 +2915,10 @@ class MainApp:
                                     filtered = tmp
                             env_visible_peaks = [(float(f0), float(a0), float(snr)) for f0, a0, snr in filtered]
                             pfx, pfy = zip(*[(f0, a0) for f0, a0, _ in env_visible_peaks])
-                            env_ax.scatter(pfx, pfy, color="#c0392b", s=36, zorder=5, edgecolors="white", linewidths=0.6)
-                            peak_points = [(f0, a0) for f0, a0, _ in env_visible_peaks]
-                            peak_labels = [f"{f0:.2f} Hz | {a0:.3f} a.u." for f0, a0, _ in env_visible_peaks]
+                            pfx_disp = [float(f0) / freq_scale for f0 in pfx]
+                            env_ax.scatter(pfx_disp, pfy, color="#c0392b", s=36, zorder=5, edgecolors="white", linewidths=0.6)
+                            peak_points = [(float(f0) / freq_scale, float(a0)) for f0, a0, _ in env_visible_peaks]
+                            peak_labels = [f"{float(f0) / freq_scale:.2f} {freq_unit} | {a0:.3f} a.u." for f0, a0, _ in env_visible_peaks]
                             self._place_annotations(env_ax, peak_points, peak_labels, color="#c0392b", text_color="#c0392b")
                     except Exception:
                         pass
@@ -2535,9 +2943,10 @@ class MainApp:
                                 continue
                             if zmin is not None and (f0_f < zmin or f0_f > zmax):
                                 continue
-                            env_ax.axvline(f0_f, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
-                            visible_marks.append((f0_f, label, col))
-                        self._draw_frequency_markers(env_ax, visible_marks, None if zmin is None else (zmin, zmax))
+                            env_ax.axvline(f0_f / freq_scale, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
+                            visible_marks.append((f0_f / freq_scale, label, col))
+                        zoom_scaled_env = None if zmin is None else (zmin / freq_scale, zmax / freq_scale)
+                        self._draw_frequency_markers(env_ax, visible_marks, zoom_scaled_env)
                     except Exception:
                         pass
                     img_env = save_plot(env_fig)
@@ -2554,14 +2963,37 @@ class MainApp:
                     runup_enabled = bool(getattr(self, 'runup_3d_enabled', False))
                 if runup_enabled:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    try:
+                        full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
+                    except Exception:
+                        full_t_uniform, full_acc_uniform = None, None
+                    base_t = full_t_uniform if full_t_uniform is not None and full_acc_uniform is not None else t_seg
+                    base_acc = full_acc_uniform if full_t_uniform is not None and full_acc_uniform is not None else acc_seg
+                    try:
+                        runup_mask, _, _ = self._resolve_runup_period(base_t)
+                    except Exception:
+                        runup_mask = None
+                    if (
+                        runup_mask is not None
+                        and runup_mask.size == base_t.size
+                        and np.count_nonzero(runup_mask) >= 2
+                    ):
+                        runup_t = base_t[runup_mask]
+                        runup_acc = base_acc[runup_mask]
+                    else:
+                        runup_t = base_t
+                        runup_acc = base_acc
                     runup_fig = self._generate_runup_3d_figure(
-                        t_seg,
-                        sig_seg,
+                        runup_t,
+                        runup_acc,
                         fc,
                         hide_lf,
                         fmax_ui,
                         zoom_tuple,
                         False,
+                        base_t,
+                        base_acc,
+                        self.fft_window_type,
                     )
                     if runup_fig is not None:
                         img_runup = save_plot(runup_fig)
@@ -2580,8 +3012,8 @@ class MainApp:
                     y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
                     if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
                         try:
-                            x_seg_pdf = self.current_df.loc[mask, x_col].to_numpy()
-                            y_seg_pdf = self.current_df.loc[mask, y_col].to_numpy()
+                            x_seg_pdf = segment_df[x_col].to_numpy()
+                            y_seg_pdf = segment_df[y_col].to_numpy()
                         except Exception:
                             x_seg_pdf = self.current_df[x_col].to_numpy()
                             y_seg_pdf = self.current_df[y_col].to_numpy()
@@ -2682,20 +3114,35 @@ class MainApp:
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
             elements.append(Spacer(1, 18))
             elements.append(Paragraph(f"Archivo analizado: {base_name}", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Periodo analizado: {start_t:.2f}s - {end_t:.2f}s", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Fecha de generacion: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            elements.append(Spacer(1, 6))
             elements.append(Paragraph(f"Aplicacion: V-Analyzer {APP_VERSION}", styles['Normal']))
             elements.append(Spacer(1, 18))
 
             cover_summary = [
                 ["Indicador", "Valor"],
-                ["RMS velocidad", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
+                ["RMS velocidad global", f"{primary_rms_mm_pdf:.3f} mm/s"],
+                ["Clasificacion ISO global", primary_label_pdf],
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
+            for entry in axis_summaries_pdf:
+                if entry.get("is_global"):
+                    continue
+                try:
+                    axis_rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                except Exception:
+                    axis_rms_txt = "N/D"
+                cover_summary.append([
+                    f"RMS {entry.get('name', 'Eje')}",
+                    f"{axis_rms_txt} → {entry.get('iso_label', 'N/D')}"
+                ])
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
             _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
+            elements.append(Spacer(1, 16))
             elements.append(PageBreak())
 
             # Nota filtro visual (export): obtiene estado actual de la UI
@@ -2710,15 +3157,48 @@ class MainApp:
             _pdf_fft_filter_note = f"Filtro visual FFT: oculta < {_pdf_fc:.2f} Hz" if _pdf_hide_lf else "Filtro visual FFT: sin ocultar"
 
             elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            elements.append(Spacer(1, 8))
             exec_findings_all = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
-            elements.append(Paragraph(f"Clasificacion ISO: {severity_mm}", styles['Normal']))
-            elements.append(Paragraph(f"RMS velocidad: {rms_mm:.3f} mm/s", styles['Normal']))
+            elements.append(Paragraph(f"Clasificacion ISO global: {severity_mm}", styles['Normal']))
+            elements.append(Spacer(1, 4))
+            elements.append(Paragraph(f"RMS velocidad global: {rms_mm:.3f} mm/s", styles['Normal']))
+            if axis_table_rows:
+                tbl_axes = Table(axis_table_rows, colWidths=[160, 120, 180])
+                _apply_table_style(tbl_axes)
+                elements.append(tbl_axes)
+                elements.append(Spacer(1, 10))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
+            elements.append(Spacer(1, 4))
+            frac_low_pdf = float(features_full.get('frac_low', 0.0))
+            frac_mid_pdf = float(features_full.get('frac_mid', 0.0))
+            frac_high_pdf = float(features_full.get('frac_high', 0.0))
+            if (frac_low_pdf + frac_mid_pdf + frac_high_pdf) > 0:
+                balance_row = [
+                    f"Baja (0-30 Hz): {frac_low_pdf * 100:.1f}%",
+                    f"Media (30-120 Hz): {frac_mid_pdf * 100:.1f}%",
+                    f"Alta (>120 Hz): {frac_high_pdf * 100:.1f}%",
+                ]
+                balance_tbl = Table([balance_row], colWidths=[150, 180, 160], hAlign="LEFT")
+                balance_tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#3498db")),
+                            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#9b59b6")),
+                            ("BACKGROUND", (2, 0), (2, 0), colors.HexColor("#e67e22")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("FONTSIZE", (0, 0), (-1, 0), 10),
+                            ("BOX", (0, 0), (-1, 0), 0.25, colors.white),
+                        ]
+                    )
+                )
+                elements.append(balance_tbl)
+                elements.append(Spacer(1, 10))
             elements.append(Paragraph(_pdf_fft_filter_note, styles['Normal']))
-            elements.append(Spacer(1, 8))
+            elements.append(Spacer(1, 10))
             # Semáforo de severidad (actual + otros atenuados)
             try:
                 # Mapear label a índice
@@ -2785,22 +3265,35 @@ class MainApp:
             # Explicación y recomendaciones (unificadas con la app)
             exp_lines_pdf2 = self._build_explanations(res, exec_findings)
             elements.append(Paragraph("Explicacion y recomendaciones", styles['Heading2']))
-            for line in exp_lines_pdf2:
-                elements.append(Paragraph(f"- {line}", styles['Normal']))
+            elements.append(Spacer(1, 6))
+            if exp_lines_pdf2:
+                items = [
+                    ListItem(Paragraph(line, styles['Normal']), leftIndent=12, bulletColor=accent_color)
+                    for line in exp_lines_pdf2
+                ]
+                elements.append(ListFlowable(items, bulletType="bullet", start="•", spaceBefore=0, spaceAfter=6))
+            elements.append(Spacer(1, 12))
 
             
 
             elements.append(Paragraph("Reporte de Análisis de Vibraciones", title_style))
+            elements.append(Spacer(1, 8))
             elements.append(Paragraph(f"Archivo: {base_name}", styles['Normal']))
+            elements.append(Spacer(1, 4))
             elements.append(Paragraph(f"Periodo: {start_t:.2f}s - {end_t:.2f}s", styles['Normal']))
             elements.append(Spacer(1, 12))
 
             # Top picos (FFT)
             if top_peaks:
                 elements.append(Paragraph("Picos principales (FFT)", styles['Heading2']))
-                peaks_data = [["Frecuencia (Hz)", "Amplitud (mm/s)", "Orden (X)"]]
+                elements.append(Spacer(1, 6))
+                peaks_data = [[f"Frecuencia ({freq_unit})", "Amplitud (mm/s)", "Orden (X)"]]
                 for pf, pa, order in top_peaks:
-                    peaks_data.append([f"{pf:.2f}", f"{pa:.3f}", f"{order:.2f}" if order else "-"])
+                    peaks_data.append([
+                        f"{pf / freq_scale:.2f}",
+                        f"{pa:.3f}",
+                        f"{order:.2f}" if order else "-",
+                    ])
                 tbl_peaks = Table(peaks_data, colWidths=[120, 140, 120])
                 _apply_table_style(tbl_peaks)
                 elements.append(tbl_peaks)
@@ -2808,25 +3301,46 @@ class MainApp:
 
             data_summary = [
                 ["Metrica", "Valor"],
-                ["RMS (velocidad)", f"{rms_mm:.3f} mm/s"],
-                ["Clasificacion ISO", severity_mm],
-                ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
+                ["RMS velocidad global", f"{rms_mm:.3f} mm/s"],
+                ["Clasificacion ISO global", primary_label_pdf],
+                [
+                    "Frecuencia dominante",
+                    f"{features_full['dom_freq'] / freq_scale:.2f} {freq_unit}",
+                ],
             ]
+            for entry in axis_summaries_pdf:
+                if entry.get("is_global"):
+                    continue
+                try:
+                    axis_rms_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                except Exception:
+                    axis_rms_txt = "N/D"
+                data_summary.append([
+                    f"RMS {entry.get('name', 'Eje')}",
+                    f"{axis_rms_txt} → {entry.get('iso_label', 'N/D')}"
+                ])
             table_summary = Table(data_summary, colWidths=[200, 200])
             _apply_table_style(table_summary)
             elements.append(table_summary)
-            elements.append(Spacer(1, 12))
+            elements.append(Spacer(1, 16))
 
             elements.append(Image(img_time, width=400, height=150))
+            elements.append(Spacer(1, 10))
             elements.append(Image(img_fft, width=400, height=150))
             if img_env:
+                elements.append(Spacer(1, 10))
                 elements.append(Image(img_env, width=400, height=150))
                 if env_visible_peaks:
                     elements.append(Spacer(1, 8))
                     elements.append(Paragraph("Picos principales (envolvente)", styles['Heading2']))
-                    env_table_data = [["Frecuencia (Hz)", "Amplitud (a.u.)", "SNR (dB)"]]
+                    elements.append(Spacer(1, 4))
+                    env_table_data = [[f"Frecuencia ({freq_unit})", "Amplitud (a.u.)", "SNR (dB)"]]
                     for f0, a0, snr in env_visible_peaks:
-                        env_table_data.append([f"{f0:.2f}", f"{a0:.3f}", f"{snr:.1f}"])
+                        env_table_data.append([
+                            f"{f0 / freq_scale:.2f}",
+                            f"{a0:.3f}",
+                            f"{snr:.1f}",
+                        ])
                     env_table = Table(env_table_data, colWidths=[120, 140, 120])
                     _apply_table_style(env_table)
                     elements.append(env_table)
@@ -3749,19 +4263,16 @@ class MainApp:
 
             # Periodo seleccionado
 
-            try:
-
-                start_t = float(self.start_time_field.value) if self.start_time_field.value else t[0]
-
-                end_t = float(self.end_time_field.value) if self.end_time_field.value else t[-1]
-
-            except:
-
-                start_t, end_t = t[0], t[-1]
-
-            mask = (t >= start_t) & (t <= end_t)
-
-            t_seg, sig_seg = t[mask], signal[mask]
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                mask = np.isfinite(np.asarray(t, dtype=float))
+                start_t = float(np.nanmin(t[mask])) if np.any(mask) else 0.0
+                end_t = float(np.nanmax(t[mask])) if np.any(mask) else 0.0
+            segment_idx = np.nonzero(mask)[0]
+            t_seg_raw = t[segment_idx]
+            sig_seg_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
+            t_seg, acc_seg, _, _ = self._prepare_segment_for_analysis(t_seg_raw, sig_seg_raw, fft_signal_col)
 
 
 
@@ -3782,19 +4293,19 @@ class MainApp:
                 mag_vel_mm = mag_vel * 1000.0
                 return xf, mag_vel_mm, mag_vel
 
-            xf, mag_vel_mm, mag_vel = compute_fft_dual(sig_seg, t_seg)
+            xf, mag_vel_mm, mag_vel = compute_fft_dual(acc_seg, t_seg)
             rms_mm = float(np.sqrt(np.mean(mag_vel_mm**2))) if mag_vel_mm is not None else 0.0
             rms_ms = float(np.sqrt(np.mean(mag_vel**2))) if mag_vel is not None else 0.0
             severity_mm = self._classify_severity(rms_mm)
             severity_label_ms, severity_color_ms = self._classify_severity_ms(rms_ms)
 
             # --- Features + diagnóstico para el PDF (usa mm/s) ---
-            features_full = self._extract_features(t_seg, sig_seg, xf, mag_vel_mm)
+            features_full = self._extract_features(t_seg, acc_seg, xf, mag_vel_mm)
             # Guardar última FFT/segmento para diagnóstico avanzado (PDF)
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_seg
-            self._last_accseg = sig_seg
+            self._last_accseg = acc_seg
             findings_pdf = res.get('diagnosis', [])
             severity_entry_pdf = res.get('diagnosis_summary')
             findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
@@ -3825,26 +4336,47 @@ class MainApp:
 
 
 
+            try:
+                unit_mode = getattr(self.time_unit_dd, 'value', 'vel_mm')
+            except Exception:
+                unit_mode = 'vel_mm'
+            if unit_mode == 'vel_mm':
+                _y_time = self._acc_to_vel_time_mm(acc_seg, t_seg)
+                _ylabel = 'Velocidad [mm/s]'
+                _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else 'RMS vel: 0.000 mm/s'
+            elif unit_mode == 'acc_g':
+                _y_time = acc_seg / 9.80665
+                _ylabel = 'Aceleración [g]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
+            else:
+                _y_time = acc_seg
+                _ylabel = 'Aceleración [m/s²]'
+                _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
+
             # Señal principal
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            if len(t_seg) > 0 and len(_y_time) > 0:
+                ax1.plot(t_seg, _y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            # Anotar RMS aceleración
+            ax1.set_ylabel(_ylabel)
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
+                text_color = 'white' if self.is_dark_mode else 'black'
+                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va='top', color=text_color)
             except Exception:
                 pass
             img_time = save_plot(fig1)
 
             fig2, ax2 = plt.subplots(figsize=(8, 3))
+            freq_scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+            if not np.isfinite(freq_scale) or freq_scale <= 0:
+                freq_scale = 1.0
+            freq_unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
             if xf is not None and mag_vel_mm is not None:
-                ax2.plot(xf, mag_vel_mm, color=self.fft_plot_color)
+                xdisp = np.asarray(xf, dtype=float) / freq_scale
+                ax2.plot(xdisp, mag_vel_mm, color=self.fft_plot_color)
             ax2.set_title(f"FFT (Velocidad)")
-            ax2.set_xlabel("Frecuencia (Hz)")
+            ax2.set_xlabel(f"Frecuencia ({freq_unit})")
             ax2.set_ylabel("Velocidad [mm/s]")
             # Anotación RMS (m/s) y eje superior en RPM
             try:
@@ -3852,14 +4384,16 @@ class MainApp:
                 ax2.text(0.02, 0.95, f"RMS vel: {rms_mm:.3f} mm/s", transform=ax2.transAxes,
                          va="top", color=text_color)
                 ax2_rpm = ax2.twiny()
-                ax2_rpm.set_xlim(ax2.get_xlim()[0]*60, ax2.get_xlim()[1]*60)
+                xlim = ax2.get_xlim()
+                ax2_rpm.set_xlim(xlim[0] * freq_scale * 60, xlim[1] * freq_scale * 60)
                 ax2_rpm.set_xlabel("Frecuencia (RPM)")
             except Exception:
                 pass
             # Eje superior en RPM
             try:
                 ax2_rpm = ax2.twiny()
-                ax2_rpm.set_xlim(ax2.get_xlim()[0] * 60, ax2.get_xlim()[1] * 60)
+                xlim = ax2.get_xlim()
+                ax2_rpm.set_xlim(xlim[0] * freq_scale * 60, xlim[1] * freq_scale * 60)
                 ax2_rpm.set_xlabel("Frecuencia (RPM)")
             except Exception:
                 pass
@@ -3995,6 +4529,30 @@ class MainApp:
             elements.append(Paragraph(f"Clasificacion ISO: {severity_mm}", styles['Normal']))
             elements.append(Paragraph(f"RMS velocidad: {rms_mm:.3f} mm/s", styles['Normal']))
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
+            frac_low_pdf2 = float(features_full.get('frac_low', 0.0))
+            frac_mid_pdf2 = float(features_full.get('frac_mid', 0.0))
+            frac_high_pdf2 = float(features_full.get('frac_high', 0.0))
+            if (frac_low_pdf2 + frac_mid_pdf2 + frac_high_pdf2) > 0:
+                balance_row2 = [
+                    f"Baja (0-30 Hz): {frac_low_pdf2 * 100:.1f}%",
+                    f"Media (30-120 Hz): {frac_mid_pdf2 * 100:.1f}%",
+                    f"Alta (>120 Hz): {frac_high_pdf2 * 100:.1f}%",
+                ]
+                balance_tbl2 = Table([balance_row2], colWidths=[150, 180, 160], hAlign="LEFT")
+                balance_tbl2.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#3498db")),
+                            ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#9b59b6")),
+                            ("BACKGROUND", (2, 0), (2, 0), colors.HexColor("#e67e22")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("FONTSIZE", (0, 0), (-1, 0), 10),
+                            ("BOX", (0, 0), (-1, 0), 0.25, colors.white),
+                        ]
+                    )
+                )
+                elements.append(balance_tbl2)
             elements.append(Paragraph(_pdf_fft_filter_note2, styles['Normal']))
             elements.append(Spacer(1, 8))
             elements.append(Paragraph("Diagnóstico:", styles['SectionHeading']))
@@ -4243,11 +4801,27 @@ class MainApp:
 
         # Parámetros de máquina (opcionales) para diagnóstico avanzado
         # Selección de unidad para la señal en tiempo (aceleración vs velocidad)
+        self.input_signal_unit_dd = ft.Dropdown(
+            label="Unidad original",
+            options=[
+                ft.dropdown.Option("acc_ms2", "Aceleración (m/s²)"),
+                ft.dropdown.Option("acc_g", "Aceleración (g)"),
+                ft.dropdown.Option("vel_ms", "Velocidad (m/s)"),
+                ft.dropdown.Option("vel_mm", "Velocidad (mm/s)"),
+                ft.dropdown.Option("vel_ips", "Velocidad (in/s)"),
+                ft.dropdown.Option("disp_m", "Desplazamiento (m)"),
+                ft.dropdown.Option("disp_mm", "Desplazamiento (mm)"),
+                ft.dropdown.Option("disp_um", "Desplazamiento (µm)"),
+            ],
+            value=self.input_signal_unit if getattr(self, "input_signal_unit", None) else "acc_ms2",
+            width=220,
+            on_change=self._on_input_signal_unit_change,
+        )
         self.time_unit_dd = ft.Dropdown(
             label="Señal de tiempo",
             options=[
                 ft.dropdown.Option("acc", "Aceleración (m/s^2)"),
-                ft.dropdown.Option("acc_g", "Aceleraci3n (g)"),
+                ft.dropdown.Option("acc_g", "Aceleración (g)"),
                 ft.dropdown.Option("vel_mm", "Velocidad (mm/s)"),
             ],
             value="vel_mm",
@@ -4421,6 +4995,17 @@ class MainApp:
             on_change=self._on_fft_color_change,
         )
 
+        self.fft_window_dd = ft.Dropdown(
+            label="Ventana FFT",
+            options=[
+                ft.dropdown.Option("hann", "Hann"),
+                ft.dropdown.Option("flattop", "Flat-Top"),
+            ],
+            value=self.fft_window_type,
+            width=160,
+            on_change=self._on_fft_window_change,
+        )
+
 
 
 
@@ -4429,6 +5014,20 @@ class MainApp:
         self.start_time_field = ft.TextField(label="Inicio (s)", value="0.0", width=100)
 
         self.end_time_field = ft.TextField(label="Fin (s)", value="", width=100)
+
+        self.runup_start_field = ft.TextField(
+            label="Inicio arranque (s)",
+            value="",
+            width=140,
+            tooltip="Delimita el análisis específico para la cascada de arranque/paro.",
+        )
+
+        self.runup_end_field = ft.TextField(
+            label="Fin arranque (s)",
+            value="",
+            width=140,
+            tooltip="Delimita el análisis específico para la cascada de arranque/paro.",
+        )
 
         # Opciones visuales de frecuencias en FFT
         self.hide_lf_cb = ft.Checkbox(label="Ocultar bajas frecuencias", value=True)
@@ -4518,6 +5117,10 @@ class MainApp:
         self.db_ymin_field = ft.TextField(label="Y mín (dB)", value="", width=100)
         self.db_ymax_field = ft.TextField(label="Y máx (dB)", value="", width=100)
         # Recalcular al cambiar estas opciones
+        self.start_time_field.on_change = self._update_analysis
+        self.end_time_field.on_change = self._update_analysis
+        self.runup_start_field.on_change = self._update_analysis
+        self.runup_end_field.on_change = self._update_analysis
         self.hide_lf_cb.on_change = self._update_analysis
         self.lf_cutoff_field.on_change = self._update_analysis
         self.db_scale_cb.on_change = self._update_analysis
@@ -4540,7 +5143,7 @@ class MainApp:
                 ft.Text("Columnas base", size=14, weight="bold"),
                 ft.Row([self.time_dropdown, self.fft_dropdown], spacing=10),
                 ft.Text("Unidades y colores", size=14, weight="bold"),
-                ft.Row([self.time_unit_dd], spacing=10),
+                ft.Row([self.input_signal_unit_dd, self.time_unit_dd], spacing=10, wrap=True),
                 ft.Row([self.time_color_dd, self.fft_color_dd], spacing=10),
             ],
             spacing=12,
@@ -4565,9 +5168,11 @@ class MainApp:
         spectrum_settings = ft.Column(
             [
                 ft.Text("⏱️ Periodo de análisis", size=14, weight="bold"),
-                ft.Row([self.start_time_field, self.end_time_field], spacing=10),
+                ft.Row([self.start_time_field, self.end_time_field], spacing=10, wrap=True),
+                ft.Text("🚀 Periodo arranque/paro", size=14, weight="bold"),
+                ft.Row([self.runup_start_field, self.runup_end_field], spacing=10, wrap=True),
                 ft.Text("Opciones de espectro", size=14, weight="bold"),
-                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.runup_3d_cb], spacing=10, wrap=True),
+                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.fft_window_dd, self.runup_3d_cb], spacing=10, wrap=True),
                 ft.Row([self.orbit_cb, self.orbit_x_dd, self.orbit_y_dd], spacing=10, wrap=True),
                 ft.Column([self.fft_zoom_text, self.fft_zoom_slider], spacing=4),
                 ft.Text("Escala y calibración", size=14, weight="bold"),
@@ -4936,12 +5541,39 @@ class MainApp:
         fmax_ui: Optional[float],
         zoom_range: Optional[Tuple[float, float]],
         dark_mode: bool,
+        fallback_time: Optional[np.ndarray] = None,
+        fallback_signal: Optional[np.ndarray] = None,
+        window_type: Optional[str] = None,
     ):
         try:
-            t = np.asarray(t_segment, dtype=float).ravel()
-            y = np.asarray(signal_segment, dtype=float).ravel()
-            if t.size < 256 or y.size != t.size:
-                return None
+            primary_t = np.asarray(t_segment, dtype=float).ravel()
+            primary_y = np.asarray(signal_segment, dtype=float).ravel()
+            fallback_t = (
+                np.asarray(fallback_time, dtype=float).ravel()
+                if fallback_time is not None
+                else None
+            )
+            fallback_y = (
+                np.asarray(fallback_signal, dtype=float).ravel()
+                if fallback_signal is not None
+                else None
+            )
+            min_samples = 256
+            t = primary_t
+            y = primary_y
+            if t.size < min_samples or y.size != t.size:
+                if (
+                    fallback_t is not None
+                    and fallback_y is not None
+                    and fallback_t.size == fallback_y.size
+                    and fallback_t.size >= min_samples
+                ):
+                    t = fallback_t
+                    y = fallback_y
+                else:
+                    min_samples = 128
+                    if t.size < min_samples or y.size != t.size:
+                        return None
             dt = float(np.median(np.diff(t)))
             if not (np.isfinite(dt) and dt > 0):
                 return None
@@ -4954,19 +5586,27 @@ class MainApp:
             nfft = min(nfft, n)
             if nfft < 128:
                 return None
-            window = np.hanning(nfft)
+            window, cg = _build_fft_window(window_type, nfft)
+            if window.size != nfft:
+                window = np.hanning(nfft)
+                cg = float(np.mean(window)) if np.any(window) else 1.0
+                if not np.isfinite(cg) or abs(cg) < 1e-12:
+                    cg = 1.0
             step = max(1, int(nfft * 0.25))
             if step >= nfft:
                 step = max(1, nfft // 4)
             spectra: List[np.ndarray] = []
             times: List[float] = []
             freq_axis = None
-            norm = 2.0 / float(nfft)
             for start in range(0, n - nfft + 1, step):
                 segment = y[start:start + nfft]
                 windowed = segment * window
                 fft_vals = np.fft.rfft(windowed)
-                mag_acc = norm * np.abs(fft_vals)
+                mag_acc = np.abs(fft_vals) / (nfft * cg)
+                if nfft % 2 == 0 and mag_acc.size >= 2:
+                    mag_acc[1:-1] *= 2.0
+                elif mag_acc.size >= 2:
+                    mag_acc[1:] *= 2.0
                 if freq_axis is None:
                     freq_axis = np.fft.rfftfreq(nfft, dt)
                 vel_spec = np.zeros_like(mag_acc)
@@ -4992,15 +5632,20 @@ class MainApp:
             amp = spec_arr[:, freq_mask].T  # freq x time
             if freq_sel.size == 0 or amp.size == 0:
                 return None
+            freq_scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+            if not np.isfinite(freq_scale) or freq_scale <= 0:
+                freq_scale = 1.0
+            freq_unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
+            freq_sel_disp = freq_sel / freq_scale
             fig = plt.figure(figsize=(10, 6))
             face = "#0f141b" if dark_mode else "white"
             fig.patch.set_facecolor(face)
             ax = fig.add_subplot(111, projection="3d")
             ax.set_facecolor(face)
-            T, F = np.meshgrid(times_arr, freq_sel)
+            T, F = np.meshgrid(times_arr, freq_sel_disp)
             surf = ax.plot_surface(T, F, amp, cmap="viridis", linewidth=0, antialiased=True)
             ax.set_xlabel("Tiempo (s)")
-            ax.set_ylabel("Frecuencia (Hz)")
+            ax.set_ylabel(f"Frecuencia ({freq_unit})")
             ax.set_zlabel("Velocidad [mm/s]")
             ax.set_title("Arranque/Paro - Cascada 3D")
             try:
@@ -5271,9 +5916,38 @@ class MainApp:
 
     def _format_fft_zoom_label(self, start: float, end: float, full_range: Tuple[float, float]) -> str:
         min_val, max_val = full_range
+        scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+        if not np.isfinite(scale) or scale <= 0:
+            scale = 1.0
+        unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
+        precision = 3 if scale >= 1000.0 else 1
+        fmt = "{:." + str(precision) + "f}"
+        min_txt = fmt.format(min_val / scale)
+        max_txt = fmt.format(max_val / scale)
+        start_txt = fmt.format(start / scale)
+        end_txt = fmt.format(end / scale)
         if abs(start - min_val) <= 1e-6 and abs(end - max_val) <= 1e-6:
-            return f"Zoom FFT: completo ({min_val:.1f} - {max_val:.1f} Hz)"
-        return f"Zoom FFT: {start:.1f} - {end:.1f} Hz"
+            return f"Zoom FFT: completo ({min_txt} - {max_txt} {unit})"
+        return f"Zoom FFT: {start_txt} - {end_txt} {unit}"
+
+    def _apply_fft_display_units(
+        self,
+        full_range: Optional[Tuple[float, float]],
+        zoom_range: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        """Selecciona Hz o kHz según el rango visible en la FFT."""
+
+        freq_max: Optional[float] = None
+        for rng in (zoom_range, full_range):
+            if rng and len(rng) == 2 and rng[1] > rng[0] and np.isfinite(rng[1]):
+                freq_max = float(rng[1])
+                break
+        if freq_max is not None and freq_max >= 1500.0:
+            self._fft_display_scale = 1000.0
+            self._fft_display_unit = "kHz"
+        else:
+            self._fft_display_scale = 1.0
+            self._fft_display_unit = "Hz"
 
     def _update_fft_zoom_controls(self, full_range: Optional[Tuple[float, float]], current_range: Optional[Tuple[float, float]]):
         slider = getattr(self, 'fft_zoom_slider', None)
@@ -5300,6 +5974,7 @@ class MainApp:
             else:
                 start_val = max(min_val, min(current_range[0], max_val))
                 end_val = max(start_val + 1e-6, min(current_range[1], max_val))
+            self._apply_fft_display_units(full_range, (start_val, end_val))
             if slider:
                 slider.min = min_val
                 slider.max = max_val
@@ -5326,6 +6001,7 @@ class MainApp:
             return
         label = getattr(self, 'fft_zoom_text', None)
         if label and self._fft_full_range:
+            self._apply_fft_display_units(self._fft_full_range, (start, end))
             label.value = self._format_fft_zoom_label(start, end, self._fft_full_range)
             if label.page:
                 label.update()
@@ -5385,85 +6061,318 @@ class MainApp:
         return selected
 
     def _build_explanations(self, res: Dict[str, Any], findings: List[str]) -> List[str]:
+        """Genera una única revisión con motivo y acción alineados a ISO."""
+
+        def _normalize(text: str) -> str:
+            if text is None:
+                return ""
+            normalized = unicodedata.normalize("NFD", str(text))
+            return normalized.encode("ascii", "ignore").decode("ascii").lower()
+
+        explanations: List[str] = []
+        try:
+            severity = res.get("severity", {}) if isinstance(res, dict) else {}
+            iso_label = str(severity.get("label", "Sin clasificación ISO"))
+            try:
+                rms_val = float(severity.get("rms_mm_s", 0.0))
+                rms_txt = f"{rms_val:.3f} mm/s"
+            except Exception:
+                rms_val = None
+                rms_txt = "N/D"
+
+            iso_contexts = [
+                {"key": "Buena", "zone": "Zona A", "range": "≤ 2.8 mm/s"},
+                {"key": "Satisfactoria", "zone": "Zona B", "range": "2.8 – 4.5 mm/s"},
+                {"key": "Insatisfactoria", "zone": "Zona C", "range": "4.5 – 7.1 mm/s"},
+                {"key": "Inaceptable", "zone": "Zona D", "range": "> 7.1 mm/s"},
+            ]
+            zone_clause = None
+            for ctx in iso_contexts:
+                if ctx["key"].lower() in iso_label.lower():
+                    zone_clause = f"{ctx['zone']} ({ctx['range']})"
+                    break
+            severity_clause = iso_label
+            if zone_clause:
+                severity_clause = f"{iso_label} – {zone_clause}"
+            if rms_val is not None:
+                severity_clause = f"{severity_clause} con {rms_txt}"
+
+            normalized_findings = [str(item).strip() for item in (findings or []) if str(item).strip()]
+            main_finding = normalized_findings[0] if normalized_findings else ""
+            main_norm = _normalize(main_finding)
+
+            profiles = [
+                {
+                    "keywords": ["desbalanceo"],
+                    "reason": "Predominio del armónico 1X y energía concentrada en baja frecuencia.",
+                    "action": "Programar balanceo dinámico y revisar acoplamientos y sujeciones.",
+                    "charlotte": "Tabla Charlotte – EM01 Desbalanceo del rotor",
+                },
+                {
+                    "keywords": ["desalineacion", "desalineaci"],
+                    "reason": "Armónicos 2X/3X elevados respecto a 1X según la severidad ISO.",
+                    "action": "Verificar alineación angular/paralela y rigidez de la base.",
+                    "charlotte": "Tabla Charlotte – EM02/EM03 Desalineación",
+                },
+                {
+                    "keywords": ["holgura"],
+                    "reason": "Múltiples armónicos de 1X con modulación que indica holgura mecánica.",
+                    "action": "Inspeccionar fijaciones, tolerancias y aprietes estructurales.",
+                    "charlotte": "Tabla Charlotte – EM04 Holgura mecánica",
+                },
+                {
+                    "keywords": ["engran"],
+                    "reason": "Componentes de malla y bandas laterales asociadas al tren de engranes.",
+                    "action": "Revisar desgaste de dientes, juego y lubricación del engranaje.",
+                    "charlotte": "Tabla Charlotte – EM19 Problemas en acoplamiento/engranes",
+                },
+                {
+                    "keywords": ["rodamiento"],
+                    "reason": "Picos en envolvente en BPFO/BPFI/BSF/FTF compatibles con daño de rodamiento.",
+                    "action": "Evaluar lubricación, holguras y condición de pistas y elementos rodantes.",
+                    "charlotte": "Tabla Charlotte – EM14–EM17 Fallas en rodamientos",
+                },
+                {
+                    "keywords": ["electrico", "linea"],
+                    "reason": "Componentes a la frecuencia de línea y su 2X excediendo la zona ISO.",
+                    "action": "Balancear fases, revisar variador y conexiones del estator.",
+                    "charlotte": "Tabla Charlotte – EM12/EM13 Problemas eléctricos",
+                },
+                {
+                    "keywords": ["resonancia"],
+                    "reason": "Picos agudos con factor Q alto fuera de armónicos cinemáticos conocidos.",
+                    "action": "Verificar rigidez estructural y considerar prueba modal/FRF.",
+                    "charlotte": "Tabla Charlotte – EM06 Resonancia estructural",
+                },
+            ]
+
+            selected_profile = None
+            for profile in profiles:
+                if any(keyword in main_norm for keyword in profile["keywords"]):
+                    selected_profile = profile
+                    break
+            if not selected_profile and main_norm.startswith("sin anomalia"):
+                selected_profile = {
+                    "reason": "Los niveles de vibración se mantienen dentro de los límites aceptables de la ISO.",
+                    "action": "Continuar con monitoreo rutinario y verificación periódica de condiciones.",
+                    "charlotte": None,
+                }
+            if not selected_profile:
+                selected_profile = {
+                    "reason": "No se identificó una anomalía predominante en la evaluación automática.",
+                    "action": "Corroborar parámetros operativos y asegurar montaje correcto antes de intervenir.",
+                    "charlotte": None,
+                }
+
+            energy_text = None
+            try:
+                energy = res.get("fft", {}).get("energy", {}) if isinstance(res, dict) else {}
+                total = float(energy.get("total", 0.0))
+                if total > 0:
+                    low = float(energy.get("low", 0.0)) / total
+                    mid = float(energy.get("mid", 0.0)) / total
+                    high = float(energy.get("high", 0.0)) / total
+                    energy_text = f"Energía espectral: baja {low:.0%}, media {mid:.0%}, alta {high:.0%}."
+            except Exception:
+                energy_text = None
+
+            parts: List[str] = [f"Revisión ISO 10816/20816 – {severity_clause}."]
+            if selected_profile.get("reason"):
+                parts.append(f"Motivo principal: {selected_profile['reason']}")
+            if selected_profile.get("action"):
+                parts.append(f"Acción recomendada: {selected_profile['action']}")
+            if selected_profile.get("charlotte"):
+                parts.append(f"Referencia: {selected_profile['charlotte']}.")
+            if energy_text:
+                parts.append(energy_text)
+
+            explanations.append(" ".join(parts))
+        except Exception:
+            explanations.append("Revisión ISO 10816/20816 – información no disponible. Verifique los datos de entrada.")
+        return explanations
+
+    def _resolve_analysis_period(
+        self, time_vector: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
+        """Calcula el periodo válido de análisis según la UI y devuelve la máscara correspondiente.
+
+        Respeta el rango seleccionado por el usuario; si no se especifica inicio/fin,
+        analiza todo el registro disponible.
         """
-        Genera una lista de líneas de "Explicación y recomendaciones" basadas en:
-        - Resultado unificado del analizador `res` (rms, severidad, energía por bandas).
-        - Hallazgos principales seleccionados (findings) para orientar motivos y revisiones.
-        """
-        lines: List[str] = []
+        t_arr = np.asarray(time_vector, dtype=float).ravel()
+        if t_arr.size == 0:
+            return np.zeros(0, dtype=bool), 0.0, 0.0
+        valid = np.isfinite(t_arr)
+        if not np.any(valid):
+            return np.zeros_like(t_arr, dtype=bool), 0.0, 0.0
+        t_valid = t_arr[valid]
+        full_start = float(np.nanmin(t_valid))
+        full_end = float(np.nanmax(t_valid))
+        start_val: Optional[float] = None
+        end_val: Optional[float] = None
         try:
-            sev = res.get('severity', {})
-            rms_mm = float(sev.get('rms_mm_s', 0.0))
-            sev_label = str(sev.get('label', 'N/D'))
+            raw_start = getattr(self.start_time_field, "value", None)
+            if raw_start not in (None, ""):
+                start_val = float(raw_start)
         except Exception:
-            rms_mm = 0.0
-            sev_label = 'N/D'
-
-        # Enfoque
-        lines.append("Enfoque: motor eléctrico")
-
-        # Severidad
+            start_val = None
         try:
-            lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
+            raw_end = getattr(self.end_time_field, "value", None)
+            if raw_end not in (None, ""):
+                end_val = float(raw_end)
         except Exception:
-            pass
+            end_val = None
+        start_t = start_val if start_val is not None else full_start
+        end_t = end_val if end_val is not None else full_end
+        start_t = min(max(start_t, full_start), full_end)
+        end_t = min(max(end_t, full_start), full_end)
+        if start_val is not None and end_val is not None and end_t <= start_t:
+            start_t, end_t = end_t, start_t
+        if end_t <= start_t:
+            start_t, end_t = full_start, full_end
+        mask = valid & (t_arr >= start_t) & (t_arr <= end_t)
+        if np.count_nonzero(mask) < 2:
+            mask = valid.copy()
+            start_t, end_t = full_start, full_end
+        return mask.astype(bool), float(start_t), float(end_t)
 
-        # Energía por bandas
+    def _resolve_runup_period(
+        self, time_vector: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
+        """Delimita el periodo exclusivo para la cascada de arranque/paro."""
+
+        t_arr = np.asarray(time_vector, dtype=float).ravel()
+        if t_arr.size == 0:
+            return np.zeros(0, dtype=bool), 0.0, 0.0
+        valid = np.isfinite(t_arr)
+        if not np.any(valid):
+            return np.zeros_like(t_arr, dtype=bool), 0.0, 0.0
+        t_valid = t_arr[valid]
+        full_start = float(np.nanmin(t_valid))
+        full_end = float(np.nanmax(t_valid))
+        start_val: Optional[float] = None
+        end_val: Optional[float] = None
         try:
-            en = res.get('fft', {}).get('energy', {})
-            e_total = float(en.get('total', 1e-12))
-            fl = float(en.get('low', 0.0)) / e_total if e_total > 0 else 0.0
-            fm = float(en.get('mid', 0.0)) / e_total if e_total > 0 else 0.0
-            fh = float(en.get('high', 0.0)) / e_total if e_total > 0 else 0.0
-            lines.append(f"Distribución de energía: baja {fl:.0%}, media {fm:.0%}, alta {fh:.0%}.")
+            raw_start = getattr(self.runup_start_field, "value", None)
+            if raw_start not in (None, ""):
+                start_val = float(raw_start)
         except Exception:
-            pass
+            start_val = None
+        try:
+            raw_end = getattr(self.runup_end_field, "value", None)
+            if raw_end not in (None, ""):
+                end_val = float(raw_end)
+        except Exception:
+            end_val = None
+        start_t = start_val if start_val is not None else full_start
+        end_t = end_val if end_val is not None else full_end
+        start_t = min(max(start_t, full_start), full_end)
+        end_t = min(max(end_t, full_start), full_end)
+        if start_val is not None and end_val is not None and end_t <= start_t:
+            start_t, end_t = end_t, start_t
+        if end_t <= start_t:
+            start_t, end_t = full_start, full_end
+        mask = valid & (t_arr >= start_t) & (t_arr <= end_t)
+        if np.count_nonzero(mask) < 2:
+            mask = valid.copy()
+            start_t, end_t = full_start, full_end
+        return mask.astype(bool), float(start_t), float(end_t)
 
-        # Helper para buscar presencia robusta (variantes de acentos/codificación)
-        def _has_any(keys: List[str]) -> bool:
-            for f in (findings or []):
-                try:
-                    s = str(f)
-                except Exception:
-                    continue
-                for k in keys:
-                    if k in s:
-                        return True
-            return False
+    def _normalize_time_series(self, t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Normaliza la serie temporal: limpia NaN, ordena, arranca en 0 y fuerza muestreo uniforme."""
+        t_arr = np.asarray(t, dtype=float).ravel()
+        y_arr = np.asarray(y, dtype=float).ravel()
+        mask = np.isfinite(t_arr) & np.isfinite(y_arr)
+        t_arr = t_arr[mask]
+        y_arr = y_arr[mask]
+        if t_arr.size == 0:
+            return t_arr, y_arr, 0.0
+        order = np.argsort(t_arr)
+        t_arr = t_arr[order]
+        y_arr = y_arr[order]
+        unique_t, unique_idx = np.unique(t_arr, return_index=True)
+        if unique_t.size != t_arr.size:
+            t_arr = unique_t
+            y_arr = y_arr[unique_idx]
+        t_arr = t_arr - float(t_arr[0])
+        if t_arr.size < 2:
+            return t_arr.astype(float), y_arr.astype(float), 0.0
+        diffs = np.diff(t_arr)
+        valid_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if valid_diffs.size == 0:
+            target_dt = 0.0
+        else:
+            target_dt = float(np.median(valid_diffs))
+        if not np.isfinite(target_dt) or target_dt <= 0:
+            target_dt = float(np.mean(valid_diffs)) if valid_diffs.size else 0.0
+        if not np.isfinite(target_dt) or target_dt <= 0:
+            target_dt = 1.0
+        uniform_t = np.linspace(0.0, target_dt * (t_arr.size - 1), t_arr.size)
+        need_interp = False
+        if valid_diffs.size:
+            tol = max(1e-9, 1e-3 * target_dt)
+            need_interp = np.max(np.abs(diffs - target_dt)) > tol
+        if need_interp:
+            y_uniform = np.interp(uniform_t, t_arr, y_arr)
+        else:
+            y_uniform = y_arr
+        return uniform_t.astype(float), np.asarray(y_uniform, dtype=float), float(target_dt)
 
-        # Recomendaciones por patrón
-        if _has_any(["Desbalanceo"]):
-            lines += [
-                "Motivo: 1X dominante con 2X/3X bajos y energía LF.",
-                "Revisar: balanceo de rotor/acoplamiento, fijaciones, suciedad/excentricidad.",
-            ]
-        if _has_any(["Desalineaci", "Desalineación", "Desalineacion"]):
-            lines += [
-                "Motivo: armónicos 2X/3X elevados respecto a 1X.",
-                "Revisar: alineación de ejes, calces y base.",
-            ]
-        if _has_any(["Engranes", "Engranaje"]):
-            lines += [
-                "Motivo: componente de malla apreciable.",
-                "Revisar: desgaste, juego y lubricación.",
-            ]
-        if _has_any(["Rodamientos", "Rodamiento"]):
-            lines += [
-                "Motivo: picos en envolvente en frecuencias del rodamiento.",
-                "Revisar: lubricación, holgura y daño en pistas/elementos.",
-            ]
-        if _has_any(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
-            lines += [
-                "Motivo: componentes a frecuencia de línea y/o su 2x.",
-                "Revisar: balance de fases, variador, conexiones y carga del motor.",
-            ]
-        if _has_any(["Resonancia estructural", "Resonancia"]):
-            lines += [
-                "Motivo: picos agudos con Q alto.",
-                "Revisar: rigidez/apoyos, aprietes, prueba modal/FRF.",
-            ]
+    def _convert_signal_to_acceleration(self, y: np.ndarray, dt: float, signal_label: Optional[str] = None) -> np.ndarray:
+        """Convierte una señal (velocidad/desplazamiento/aceleración) a aceleración [m/s²]."""
+        unit_map = getattr(self, "signal_unit_map", {}) or {}
+        unit = None
+        if signal_label and signal_label in unit_map:
+            unit = unit_map.get(signal_label)
+        if not unit:
+            unit = getattr(self, "input_signal_unit", "acc_ms2") or "acc_ms2"
+        y = np.asarray(y, dtype=float).ravel()
+        if y.size == 0:
+            return y
+        g = 9.80665
+        if unit == "acc_ms2":
+            acc = y
+        elif unit == "acc_g":
+            acc = y * g
+        elif unit == "vel_ms":
+            acc = np.gradient(y, dt, edge_order=2 if y.size > 2 else 1) if dt > 0 else np.zeros_like(y)
+        elif unit == "vel_mm":
+            vel = y / 1000.0
+            acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1) if dt > 0 else np.zeros_like(vel)
+        elif unit == "vel_ips":
+            vel = y * 0.0254
+            acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1) if dt > 0 else np.zeros_like(vel)
+        elif unit == "disp_m":
+            if dt > 0:
+                vel = np.gradient(y, dt, edge_order=2 if y.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(y)
+        elif unit == "disp_mm":
+            disp = y / 1000.0
+            if dt > 0:
+                vel = np.gradient(disp, dt, edge_order=2 if disp.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(disp)
+        elif unit == "disp_um":
+            disp = y * 1e-6
+            if dt > 0:
+                vel = np.gradient(disp, dt, edge_order=2 if disp.size > 2 else 1)
+                acc = np.gradient(vel, dt, edge_order=2 if vel.size > 2 else 1)
+            else:
+                acc = np.zeros_like(disp)
+        else:
+            acc = y
+        return np.asarray(acc, dtype=float)
 
-        return lines
+    def _prepare_segment_for_analysis(
+        self, t: np.ndarray, y: np.ndarray, signal_label: Optional[str] = None
+    ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Prepara la señal recortada para el análisis y devuelve tiempo uniforme y aceleración."""
+        t_uniform, y_uniform, dt = self._normalize_time_series(t, y)
+        acc = self._convert_signal_to_acceleration(y_uniform, dt, signal_label)
+        return t_uniform, acc, dt, y_uniform
 
     def _acc_to_vel_time_mm(self, acc: np.ndarray, t: np.ndarray) -> np.ndarray:
         """
@@ -5659,6 +6568,9 @@ class MainApp:
             "e_mid": e_mid,
             "e_high": e_high,
             "e_total": total_energy,
+            "frac_low": (e_low / total_energy) if total_energy > 0 else 0.0,
+            "frac_mid": (e_mid / total_energy) if total_energy > 0 else 0.0,
+            "frac_high": (e_high / total_energy) if total_energy > 0 else 0.0,
             "rms_vel_spec": rms_vel_spec,
         }
 
@@ -5861,23 +6773,18 @@ class MainApp:
 
             # --- Filtrar periodo ---
 
-            try:
+            mask, start_t, end_t = self._resolve_analysis_period(t)
+            if mask.size == 0 or np.count_nonzero(mask) < 2:
+                return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
-                start_t = float(self.start_time_field.value) if self.start_time_field.value else t[0]
+            segment_idx = np.nonzero(mask)[0]
+            t_segment_raw = t[segment_idx]
+            signal_segment_raw = signal[segment_idx]
+            segment_df = self.current_df.iloc[segment_idx]
 
-                end_t = float(self.end_time_field.value) if self.end_time_field.value else t[-1]
+            t_segment, acc_segment, _, _ = self._prepare_segment_for_analysis(t_segment_raw, signal_segment_raw, fft_signal_col)
 
-            except:
-
-                start_t, end_t = t[0], t[-1]
-
-
-
-            mask = (t >= start_t) & (t <= end_t)
-
-            t_segment, signal_segment = t[mask], signal[mask]
-
-            if len(signal_segment) < 2:
+            if len(acc_segment) < 2:
 
                 return ft.Text("⚠️ Rango inválido", size=14, color="#e74c3c")
 
@@ -5907,17 +6814,26 @@ class MainApp:
                 _fmax_pre = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
             except Exception:
                 _fmax_pre = None
+            bpfo_val = self._fldf(getattr(self, 'bpfo_field', None))
+            bpfi_val = self._fldf(getattr(self, 'bpfi_field', None))
+            bsf_val = self._fldf(getattr(self, 'bsf_field', None))
+            ftf_val = self._fldf(getattr(self, 'ftf_field', None))
+            env_lo_val = self._fldf(getattr(self, 'env_bp_lo_field', None))
+            env_hi_val = self._fldf(getattr(self, 'env_bp_hi_field', None))
             res = analyze_vibration(
                 t_segment,
-                signal_segment,
+                acc_segment,
                 rpm=rpm_val,
                 line_freq_hz=line_val,
-                bpfo_hz=self._fldf(getattr(self, 'bpfo_field', None)),
-                bpfi_hz=self._fldf(getattr(self, 'bpfi_field', None)),
-                bsf_hz=self._fldf(getattr(self, 'bsf_field', None)),
-                ftf_hz=self._fldf(getattr(self, 'ftf_field', None)),
+                bpfo_hz=bpfo_val,
+                bpfi_hz=bpfi_val,
+                bsf_hz=bsf_val,
+                ftf_hz=ftf_val,
                 gear_teeth=teeth_val,
                 pre_decimate_to_fmax_hz=_fmax_pre,
+                env_bp_lo_hz=env_lo_val,
+                env_bp_hi_hz=env_hi_val,
+                fft_window=self.fft_window_type,
             )
             # Sustituir espectros por los del analizador
             xf = res['fft']['f_hz']
@@ -5936,28 +6852,65 @@ class MainApp:
                                 start_val = max(full_min, min(current_zoom[0], full_max))
                                 end_val = max(start_val + 1e-6, min(current_zoom[1], full_max))
                                 self._fft_zoom_range = (start_val, end_val)
+                            self._apply_fft_display_units(self._fft_full_range, self._fft_zoom_range)
                             self._update_fft_zoom_controls(self._fft_full_range, self._fft_zoom_range)
                         else:
                             self._fft_full_range = None
                             self._fft_zoom_range = None
+                            self._apply_fft_display_units(None, None)
                             self._update_fft_zoom_controls(None, None)
                     else:
                         self._fft_full_range = None
                         self._fft_zoom_range = None
+                        self._apply_fft_display_units(None, None)
                         self._update_fft_zoom_controls(None, None)
                 except Exception:
                     self._fft_full_range = None
                     self._fft_zoom_range = None
+                    self._apply_fft_display_units(None, None)
                     self._update_fft_zoom_controls(None, None)
             else:
                 self._fft_full_range = None
                 self._fft_zoom_range = None
+                self._apply_fft_display_units(None, None)
                 self._update_fft_zoom_controls(None, None)
             dom_freq = res['fft']['dom_freq_hz']
             dom_amp = res['fft']['dom_amp_mm_s']
-            rms_mm = res['severity']['rms_mm_s']
-            severity_label_ms = res['severity']['label']
-            severity_color_ms = res['severity']['color']
+            selected_rms_mm = res['severity']['rms_mm_s']
+            selected_label = res['severity']['label']
+            selected_color = res['severity']['color']
+            axis_summaries, primary_entry = self._compute_axis_severity(
+                time_col,
+                mask,
+                rpm_val,
+                line_val,
+                teeth_val,
+                _fmax_pre,
+                bpfo_val,
+                bpfi_val,
+                bsf_val,
+                ftf_val,
+                env_lo_val,
+                env_hi_val,
+            )
+            if primary_entry is None:
+                primary_entry = {
+                    "name": self._axis_display_name(fft_signal_col),
+                    "column": fft_signal_col,
+                    "rms_mm_s": selected_rms_mm,
+                    "iso_label": selected_label,
+                    "emoji_label": self._classify_severity(selected_rms_mm),
+                    "color": selected_color,
+                    "is_global": False,
+                }
+                self._last_primary_severity = primary_entry
+                if not getattr(self, "_last_axis_severity", []):
+                    self._last_axis_severity = [primary_entry]
+            else:
+                self._last_primary_severity = primary_entry
+            primary_rms_mm = float(primary_entry.get("rms_mm_s", selected_rms_mm))
+            primary_label = primary_entry.get("iso_label", selected_label)
+            primary_color = primary_entry.get("color", selected_color)
             raw_findings = res.get('diagnosis', [])
             findings_core = list(res.get('diagnosis_findings', []) or [])
             if not findings_core and raw_findings:
@@ -5982,7 +6935,7 @@ class MainApp:
             except Exception:
                 frac_low = frac_mid = frac_high = 0.0
             try:
-                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s → {severity_label_ms}.")
+                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {primary_rms_mm:.3f} mm/s → {primary_label}.")
             except Exception:
                 pass
             def _has(txt: str) -> bool:
@@ -5990,24 +6943,65 @@ class MainApp:
                     return any((txt in s) for s in (findings or []))
                 except Exception:
                     return False
+            charlotte_refs = {
+                "Desbalanceo": "EM01 – Desbalanceo del rotor",
+                "Desalineaci": "EM02/EM03 – Desalineación (angular/paralela)",
+                "Holgura": "EM04 – Holgura mecánica",
+                "Engranes": "EM19 – Problemas en acoplamiento/engranes",
+                "Rodamientos": "EM14–EM17 – Fallas en rodamientos",
+                "Elctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "Eléctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "El?ctrico": "EM12/EM13 – Problemas eléctricos del estator / armónicos de línea",
+                "Resonancia": "EM06 – Resonancia estructural",
+            }
+
+            def _charlotte_line(key: str) -> Optional[str]:
+                ref = charlotte_refs.get(key)
+                return f"Tabla Charlotte: {ref}." if ref else None
+
             if _has("Desbalanceo"):
                 exp_lines.append("Motivo: 1X dominante, 2X/3X bajos y energía concentrada en baja frecuencia.")
                 exp_lines.append("Revisar: balanceo del rotor/acoplamiento, fijaciones y suciedad/excentricidad.")
+                ref_line = _charlotte_line("Desbalanceo")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Desalineaci"):
                 exp_lines.append("Motivo: armónicos 2X/3X elevados respecto a 1X.")
                 exp_lines.append("Revisar: alineación de ejes, calces y planitud de la base.")
+                ref_line = _charlotte_line("Desalineaci")
+                if ref_line:
+                    exp_lines.append(ref_line)
+            if _has("Holgura"):
+                exp_lines.append("Motivo: múltiples armónicos de 1X significativos en el espectro.")
+                exp_lines.append("Revisar: sujeciones, tolerancias mecánicas y posibles juegos en componentes.")
+                ref_line = _charlotte_line("Holgura")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Engranes"):
                 exp_lines.append("Motivo: componente de malla de engranajes apreciable.")
                 exp_lines.append("Revisar: desgaste de dientes, juego y lubricación.")
+                ref_line = _charlotte_line("Engranes")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if _has("Rodamientos"):
                 exp_lines.append("Motivo: picos en envolvente en frecuencias características de rodamientos.")
                 exp_lines.append("Revisar: lubricación, holgura y posible daño en pistas/elementos.")
-            if _has("Elctrico") or _has("Eléctrico") or _has("El?ctrico"):
+                ref_line = _charlotte_line("Rodamientos")
+                if ref_line:
+                    exp_lines.append(ref_line)
+            if _has("Elctrico") or _has("Eléctrico") or _has("El?ctrico"):
                 exp_lines.append("Motivo: componentes a frecuencia de línea y/o su 2x.")
                 exp_lines.append("Revisar: balance de fases, variador, conexiones y carga del motor.")
+                for key in ("Elctrico", "Eléctrico", "El?ctrico"):
+                    ref_line = _charlotte_line(key)
+                    if ref_line and ref_line not in exp_lines:
+                        exp_lines.append(ref_line)
             if _has("Resonancia estructural"):
                 exp_lines.append("Motivo: picos agudos con Q alto fuera de armónicos conocidos.")
                 exp_lines.append("Revisar: rigidez/soportes, aprietes y realizar prueba modal/FRF si es posible.")
+                ref_line = _charlotte_line("Resonancia")
+                if ref_line:
+                    exp_lines.append(ref_line)
             if frac_low + frac_mid + frac_high > 0:
                 try:
                     exp_lines.append(f"Distribución de energía: baja {frac_low:.0%}, media {frac_mid:.0%}, alta {frac_high:.0%} (guía del tipo de fallo).")
@@ -6017,7 +7011,7 @@ class MainApp:
             self._last_xf = xf
             self._last_spec = mag_vel_mm
             self._last_tseg = t_segment
-            self._last_accseg = signal_segment
+            self._last_accseg = acc_segment
 
 
 
@@ -6034,15 +7028,15 @@ class MainApp:
             except Exception:
                 unit_mode = "vel_mm"
             if unit_mode == "vel_mm":
-                _y_time = self._acc_to_vel_time_mm(signal_segment, t_segment)
+                _y_time = self._acc_to_vel_time_mm(acc_segment, t_segment)
                 _ylabel = "Velocidad [mm/s]"
                 _rms_text = f"RMS vel: {self._calculate_rms(_y_time):.3f} mm/s" if _y_time.size else "RMS vel: 0.000 mm/s"
             elif unit_mode == "acc_g":
-                _y_time = signal_segment / 9.80665
+                _y_time = acc_segment / 9.80665
                 _ylabel = "Aceleración [g]"
                 _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3f} g"
             else:
-                _y_time = signal_segment
+                _y_time = acc_segment
                 _ylabel = "Aceleración [m/s²]"
                 _rms_text = f"RMS acc: {self._calculate_rms(_y_time):.3e} m/s^2"
 
@@ -6054,12 +7048,12 @@ class MainApp:
 
             ax1.set_xlabel("Tiempo (s)")
 
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS de Aceleracion (tiempo)
             try:
                 text_color = "white" if self.is_dark_mode else "black"
-                rms_acc = self._calculate_rms(signal_segment)
+                rms_acc = self._calculate_rms(acc_segment)
                 ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes,
                          va="top", color=text_color)
             except Exception:
@@ -6086,6 +7080,10 @@ class MainApp:
                     zmin, zmax = float(zoom_range[0]), float(zoom_range[1])
                 except Exception:
                     zmin = zmax = None
+            freq_scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+            if not np.isfinite(freq_scale) or freq_scale <= 0:
+                freq_scale = 1.0
+            freq_unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
             if xf is not None and mag_vel_mm is not None:
                 mask_vis = np.ones_like(xf, dtype=bool)
                 if hide_lf:
@@ -6111,8 +7109,9 @@ class MainApp:
             except Exception:
                 use_dbv = False
 
-            ax2.plot(xplot, yplot, color=self.fft_plot_color, linewidth=2)
-            ax2.fill_between(xplot, yplot, alpha=0.3, color=self.fft_plot_color)
+            xplot_disp = np.asarray(xplot, dtype=float) / freq_scale if xplot is not None else xplot
+            ax2.plot(xplot_disp, yplot, color=self.fft_plot_color, linewidth=2)
+            ax2.fill_between(xplot_disp, yplot, alpha=0.3, color=self.fft_plot_color)
             if use_dbv:
                 try:
                     # Espectro de aceleración para dBV si el sensor es de acc
@@ -6148,7 +7147,7 @@ class MainApp:
                     eps = 1e-12
                     yplot_dbv = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
                     ax2_db = ax2.twinx()
-                    ax2_db.plot(xplot, yplot_dbv, color="#9b59b6", linewidth=1.6, linestyle="--")
+                    ax2_db.plot(xplot_disp, yplot_dbv, color="#9b59b6", linewidth=1.6, linestyle="--")
                     ax2_db.set_ylabel("Nivel [dBV]")
                     # Aplicar rango Y si se definió
                     try:
@@ -6169,7 +7168,7 @@ class MainApp:
             try:
                 ax2_rpm = ax2.twiny()
                 xmin, xmax = ax2.get_xlim()
-                ax2_rpm.set_xlim(xmin * 60.0, xmax * 60.0)
+                ax2_rpm.set_xlim(xmin * freq_scale * 60.0, xmax * freq_scale * 60.0)
                 ax2_rpm.set_xlabel("Frecuencia (RPM)")
             except Exception:
                 pass
@@ -6190,7 +7189,7 @@ class MainApp:
                         idx = idx[np.argsort(yv[idx])[::-1]]
                         peak_f = xv[idx]
                         peak_a = yv[idx]
-                        ax2.scatter(peak_f, peak_a, color="#e74c3c", s=30, zorder=5)
+                        ax2.scatter(peak_f / freq_scale, peak_a, color="#e74c3c", s=30, zorder=5)
                         f1 = self._get_1x_hz(dom_freq)
                         peak_points: List[Tuple[float, float]] = []
                         peak_labels: List[str] = []
@@ -6206,7 +7205,7 @@ class MainApp:
                                     order = pf_f / float(f1)
                                 except Exception:
                                     order = None
-                            peak_points.append((pf_f, pa_f))
+                            peak_points.append((pf_f / freq_scale, pa_f))
                             peak_labels.append(self._format_peak_label(pf_f, pa_f, order))
                         if peak_points:
                             self._place_annotations(ax2, peak_points, peak_labels, color="#e74c3c")
@@ -6235,21 +7234,22 @@ class MainApp:
                         continue
                     if zmin is not None and (f0_f < zmin or f0_f > zmax):
                         continue
-                    ax2.axvline(f0_f, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
-                    visible_marks.append((f0_f, label, col))
-                self._draw_frequency_markers(ax2, visible_marks, None if zmin is None else (zmin, zmax))
+                    ax2.axvline(f0_f / freq_scale, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
+                    visible_marks.append((f0_f / freq_scale, label, col))
+                zoom_scaled = None if zmin is None else (zmin / freq_scale, zmax / freq_scale)
+                self._draw_frequency_markers(ax2, visible_marks, zoom_scaled)
             except Exception:
                 pass
 
             ax2.set_title(f"FFT (Velocidad)")
 
-            ax2.set_xlabel("Frecuencia (Hz)")
+            ax2.set_xlabel(f"Frecuencia ({freq_unit})")
             ax2.set_ylabel("Velocidad [mm/s]")
             try:
                 if zmin is not None:
-                    ax2.set_xlim(left=zmin, right=zmax)
+                    ax2.set_xlim(left=zmin / freq_scale, right=zmax / freq_scale)
                 elif fmax_ui and fmax_ui > 0:
-                    ax2.set_xlim(left=0.0, right=float(fmax_ui))
+                    ax2.set_xlim(left=0.0, right=float(fmax_ui) / freq_scale)
             except Exception:
                 pass
 
@@ -6274,9 +7274,10 @@ class MainApp:
                     xenv = xf_env[m_env]
                     yenv = env_amp[m_env]
                     env_fig, env_ax = plt.subplots(figsize=(14, 3))
-                    env_ax.plot(xenv, yenv, color="#e67e22", linewidth=1.6)
+                    xenv_disp = np.asarray(xenv, dtype=float) / freq_scale
+                    env_ax.plot(xenv_disp, yenv, color="#e67e22", linewidth=1.6)
                     env_ax.set_title("Espectro de Envolvente")
-                    env_ax.set_xlabel("Frecuencia (Hz)")
+                    env_ax.set_xlabel(f"Frecuencia ({freq_unit})")
                     env_ax.set_ylabel("Amp [a.u.]")
                     # Picos anotados
                     try:
@@ -6300,9 +7301,10 @@ class MainApp:
                                 if tmp:
                                     filtered = tmp
                             pfx, pfy = zip(*filtered)
-                            env_ax.scatter(pfx, pfy, color="#c0392b", s=24, zorder=5)
-                            peak_points = [(float(f0), float(a0)) for f0, a0 in filtered]
-                            peak_labels = [f"{float(f0):.2f} Hz" for f0, _ in filtered]
+                            pfx_disp = [float(f0) / freq_scale for f0 in pfx]
+                            env_ax.scatter(pfx_disp, pfy, color="#c0392b", s=24, zorder=5)
+                            peak_points = [(float(f0) / freq_scale, float(a0)) for f0, a0 in filtered]
+                            peak_labels = [f"{float(f0) / freq_scale:.2f} {freq_unit}" for f0, _ in filtered]
                             self._place_annotations(env_ax, peak_points, peak_labels, color="#c0392b", text_color="#c0392b")
                     except Exception:
                         pass
@@ -6329,11 +7331,12 @@ class MainApp:
                             if zmin is not None and (f0_f < zmin or f0_f > zmax):
                                 continue
                             try:
-                                env_ax.axvline(f0_f, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
+                                env_ax.axvline(f0_f / freq_scale, color=col, linestyle='--', alpha=0.85, linewidth=1.2)
                             except Exception:
                                 pass
-                            visible_marks.append((f0_f, label, col))
-                        self._draw_frequency_markers(env_ax, visible_marks, None if zmin is None else (zmin, zmax))
+                            visible_marks.append((f0_f / freq_scale, label, col))
+                        zoom_scaled_env = None if zmin is None else (zmin / freq_scale, zmax / freq_scale)
+                        self._draw_frequency_markers(env_ax, visible_marks, zoom_scaled_env)
                     except Exception:
                         pass
                     env_chart = MatplotlibChart(env_fig, expand=True, isolated=True)
@@ -6353,8 +7356,8 @@ class MainApp:
                     y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
                     if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
                         try:
-                            x_seg = self.current_df.loc[mask, x_col].to_numpy()
-                            y_seg = self.current_df.loc[mask, y_col].to_numpy()
+                            x_seg = segment_df[x_col].to_numpy()
+                            y_seg = segment_df[y_col].to_numpy()
                         except Exception:
                             x_seg = self.current_df[x_col].to_numpy()
                             y_seg = self.current_df[y_col].to_numpy()
@@ -6379,14 +7382,37 @@ class MainApp:
             try:
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    try:
+                        full_t_uniform, full_acc_uniform, _, _ = self._prepare_segment_for_analysis(t, signal, fft_signal_col)
+                    except Exception:
+                        full_t_uniform, full_acc_uniform = None, None
+                    base_t = full_t_uniform if full_t_uniform is not None and full_acc_uniform is not None else t_segment
+                    base_acc = full_acc_uniform if full_t_uniform is not None and full_acc_uniform is not None else acc_segment
+                    try:
+                        runup_mask, _, _ = self._resolve_runup_period(base_t)
+                    except Exception:
+                        runup_mask = None
+                    if (
+                        runup_mask is not None
+                        and runup_mask.size == base_t.size
+                        and np.count_nonzero(runup_mask) >= 2
+                    ):
+                        runup_t = base_t[runup_mask]
+                        runup_acc = base_acc[runup_mask]
+                    else:
+                        runup_t = base_t
+                        runup_acc = base_acc
                     runup_fig = self._generate_runup_3d_figure(
-                        t_segment,
-                        signal_segment,
+                        runup_t,
+                        runup_acc,
                         fc,
                         hide_lf,
                         fmax_ui,
                         zoom_tuple,
                         self.is_dark_mode,
+                        base_t,
+                        base_acc,
+                        self.fft_window_type,
                     )
                     if runup_fig is not None:
                         runup_chart = MatplotlibChart(runup_fig, expand=True, isolated=True)
@@ -6430,9 +7456,84 @@ class MainApp:
                     aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
                     plt.close(aux_fig)
 
+            def _build_axis_controls() -> List[ft.Control]:
+                controls: List[ft.Control] = []
+                if not axis_summaries:
+                    return controls
+                controls.append(
+                    ft.Text(
+                        "Severidad por eje (RMS velocidad)",
+                        size=14,
+                        weight="bold",
+                        text_align=ft.TextAlign.LEFT,
+                    )
+                )
+                for entry in axis_summaries:
+                    try:
+                        value_txt = f"{float(entry.get('rms_mm_s', 0.0)):.3f} mm/s"
+                    except Exception:
+                        value_txt = "N/D"
+                    color_hex = entry.get("color", "#7f8c8d")
+                    controls.append(
+                        ft.Container(
+                            expand=True,
+                            content=ft.Column(
+                                [
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.TIMELAPSE,
+                                                size=16,
+                                                color=color_hex,
+                                            ),
+                                            ft.Text(
+                                                entry.get("name", "Eje"),
+                                                weight="bold" if entry.get("is_global") else None,
+                                                expand=True,
+                                                max_lines=1,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                                text_align=ft.TextAlign.LEFT,
+                                            ),
+                                        ],
+                                        spacing=8,
+                                        alignment="start",
+                                    ),
+                                    ft.Row(
+                                        [
+                                            ft.Text(
+                                                value_txt,
+                                                weight="bold",
+                                                text_align=ft.TextAlign.LEFT,
+                                            ),
+                                            ft.Text(
+                                                entry.get("iso_label", "N/D"),
+                                                color=color_hex,
+                                                expand=True,
+                                                max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                                text_align=ft.TextAlign.RIGHT,
+                                            ),
+                                        ],
+                                        spacing=8,
+                                        alignment="spaceBetween",
+                                        vertical_alignment="center",
+                                    ),
+                                ],
+                                spacing=6,
+                            ),
+                            border=ft.border.all(1, color_hex),
+                            border_radius=8,
+                            padding=ft.padding.symmetric(horizontal=12, vertical=10),
+                        )
+                    )
+                return controls
+
+            axis_summary_controls_exec = _build_axis_controls()
+            axis_summary_controls_main = _build_axis_controls()
+
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
-                sev_label, sev_color = severity_label_ms, severity_color_ms
+                sev_label, sev_color = primary_label, primary_color
             except Exception:
                 sev_label, sev_color = "N/D", "#7f8c8d"
             exec_findings_all = list(findings)
@@ -6440,55 +7541,159 @@ class MainApp:
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
             resumen_exec = ft.Container(
-                content=ft.Column([
-                    ft.Text("Resumen Ejecutivo", size=18, weight="bold"),
-                    ft.Row([
-                        ft.Container(width=12, height=12, bgcolor=sev_color, border_radius=6),
-                        ft.Text(f"Clasificación ISO: {sev_label}")
-                    ]),
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-                    ft.Text("Diagnóstico:"),
-                    *[ft.Text(f"- {it}") for it in exec_findings],
-                ], spacing=6),
-                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                border_radius=10,
-                padding=10
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.ANALYTICS, color=self._accent_ui()),
+                                ft.Text(
+                                    "Resumen Ejecutivo",
+                                    size=18,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Container(
+                            content=ft.Row(
+                                [
+                                ft.Icon(ft.Icons.SPEED, color=sev_color),
+                                    ft.Text(f"Clasificación ISO: {sev_label}", weight="bold"),
+                                ],
+                                spacing=8,
+                                alignment="start",
+                            ),
+                            bgcolor=ft.Colors.with_opacity(0.12, sev_color),
+                            border_radius=20,
+                            padding=ft.padding.symmetric(horizontal=14, vertical=8),
+                        ),
+                        ft.Text(
+                            f"RMS global (mm/s): {primary_rms_mm:.3f}",
+                            weight="bold",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"Frecuencia dominante: {dom_freq:.2f} Hz",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
+                        *axis_summary_controls_exec,
+                        ft.Text(
+                            "Hallazgos clave",
+                            weight="bold",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
+                                        ft.Text(
+                                            text,
+                                            expand=True,
+                                            text_align=ft.TextAlign.LEFT,
+                                            max_lines=4,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
+                                    ],
+                                    spacing=6,
+                                    alignment="start",
+                                )
+                                for text in exec_findings
+                            ],
+                            spacing=4,
+                            tight=True,
+                        ),
+                    ],
+                    spacing=12,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                border_radius=12,
+                padding=ft.padding.all(16),
             )
 
             # --- Panel resumen + diagnóstico ---
 
             resumen = ft.Container(
-
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
-
-                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
-                border_radius=10,
-
-                padding=10
-
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.INSIGHTS, color=self._accent_ui()),
+                                ft.Text(
+                                    "Resumen del análisis",
+                                    size=18,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Text(
+                            f"Periodo analizado: {start_t:.2f}s – {end_t:.2f}s",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"Frecuencia dominante: {dom_freq:.2f} Hz",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Text(
+                            f"RMS velocidad global: {primary_rms_mm:.3f} mm/s",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        self._build_severity_traffic_light(primary_rms_mm),
+                        self._build_spectral_balance_widget(frac_low, frac_mid, frac_high),
+                        *axis_summary_controls_main,
+                        ft.Text(
+                            "Crest factor (aceleración): "
+                            f"{(float(np.max(np.abs(acc_segment))) / (float(self._calculate_rms(acc_segment)) + 1e-12)):.2f}",
+                            text_align=ft.TextAlign.LEFT,
+                        ),
+                        ft.Divider(),
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.FACT_CHECK, color=self._accent_ui()),
+                                ft.Text(
+                                    "Diagnóstico automático (baseline)",
+                                    size=16,
+                                    weight="bold",
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
+                            ],
+                            spacing=8,
+                            alignment="start",
+                        ),
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.CHEVRON_RIGHT, color=self._accent_ui(), size=18),
+                                        ft.Text(
+                                            text,
+                                            expand=True,
+                                            text_align=ft.TextAlign.LEFT,
+                                            max_lines=4,
+                                            overflow=ft.TextOverflow.ELLIPSIS,
+                                        ),
+                                    ],
+                                    spacing=6,
+                                    alignment="start",
+                                )
+                                for text in findings
+                            ],
+                            spacing=4,
+                            tight=True,
+                        ),
+                    ],
+                    spacing=12,
+                ),
+                bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                border_radius=12,
+                padding=ft.padding.all(16),
             )
 
 
@@ -6505,10 +7710,13 @@ class MainApp:
             _fft_filter_note = f"Filtro visual FFT: oculta < {_fc:.2f} Hz" if _hide_lf else "Filtro visual FFT: sin ocultar"
 
             # Recalcular explicaciones con helper unificado (evita divergencias)
+            exp_lines: List[str] = []
             try:
                 exp_lines = self._build_explanations(res, findings)
             except Exception:
-                pass
+                exp_lines = []
+            if not exp_lines:
+                exp_lines = ["Revisión ISO 10816/20816 – sin información disponible."]
 
             # --- Contenedor con scroll (en Column, no en Container) ---
 
@@ -6521,15 +7729,50 @@ class MainApp:
                     controls=[
                         resumen_exec,
                     ft.Container(
-                        content=ft.Column([
-                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                            *[ft.Text(f"- {it}") for it in exp_lines],
-                        ], spacing=6),
-                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                        border_radius=10,
-                        padding=10,
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(ft.Icons.LIGHTBULB, color=self._accent_ui()),
+                                        ft.Text(
+                                            "Explicación y revisión sugerida",
+                                            size=16,
+                                            weight="bold",
+                                            text_align=ft.TextAlign.LEFT,
+                                        ),
+                                    ],
+                                    spacing=8,
+                                    alignment="start",
+                                ),
+                                ft.Column(
+                                    [
+                                        ft.Row(
+                                            [
+                                                ft.Icon(ft.Icons.CHECK_CIRCLE, color=self._accent_ui(), size=18),
+                                                ft.Text(
+                                                    line,
+                                                    expand=True,
+                                                    text_align=ft.TextAlign.LEFT,
+                                                    max_lines=4,
+                                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                                ),
+                                            ],
+                                            spacing=6,
+                                            alignment="start",
+                                        )
+                                        for line in exp_lines
+                                    ],
+                                    spacing=6,
+                                    tight=True,
+                                ),
+                            ],
+                            spacing=12,
+                        ),
+                        bgcolor=ft.Colors.with_opacity(0.06, self._accent_ui()),
+                        border_radius=12,
+                        padding=ft.padding.all(16),
                     ),
-                    ft.Text(_fft_filter_note),
+                    ft.Text(_fft_filter_note, text_align=ft.TextAlign.LEFT),
                     chart
                 ]
                     + ([runup_chart] if runup_chart else [])
@@ -7590,75 +8833,455 @@ class MainApp:
 
 
 
+    def _gather_calibration_settings(self) -> Dict[str, Dict[str, float]]:
+        """Lee los campos de calibración disponibles y devuelve un mapa simple por canal."""
+        calibs: Dict[str, Dict[str, float]] = {}
+        try:
+            sens_ctrl = getattr(self, "sens_unit_dd", None)
+            sens_value_ctrl = getattr(self, "sensor_sens_field", None)
+            if sens_ctrl is None or sens_value_ctrl is None:
+                return calibs
+            sens_unit = getattr(sens_ctrl, "value", None)
+            raw_value = getattr(sens_value_ctrl, "value", None)
+            if not sens_unit or raw_value in (None, ""):
+                return calibs
+            sens_val = float(raw_value)
+            if sens_unit == "mV/g":
+                calibs["__default__"] = {"mv_per_g": sens_val}
+            elif sens_unit == "V/g":
+                calibs["__default__"] = {"mv_per_g": sens_val * 1000.0}
+        except Exception:
+            return {}
+        return calibs
+
+    def _standardize_dataset(
+        self,
+        file_path: str,
+        df: Optional[pd.DataFrame] = None,
+        calibrations: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Normaliza un dataset a aceleración [m/s²] con tiempo en 0 y muestreo uniforme.
+
+        Devuelve un DataFrame con columnas: t_s, accX_ms2, accY_ms2, accZ_ms2 (cuando existan).
+        """
+        data_frame = None
+        if df is not None:
+            data_frame = df.copy()
+        else:
+            try:
+                data_frame = pd.read_csv(file_path)
+            except Exception:
+                data_frame = pd.read_csv(file_path, sep=';')
+        if data_frame is None or data_frame.empty:
+            return None
+
+        # Detectar columna de tiempo
+        time_col = None
+        for col in data_frame.columns:
+            col_str = str(col).lower()
+            if any(key in col_str for key in ["time", "t_s", "tiempo", "timestamp", "sample"]):
+                time_col = col
+                break
+        if time_col is None:
+            data_frame = data_frame.copy()
+            data_frame["time"] = np.arange(len(data_frame), dtype=float) / 10000.0
+            time_col = "time"
+
+        t_raw = pd.to_numeric(data_frame[time_col], errors="coerce").to_numpy(dtype=float)
+        scale_to_seconds = 1.0
+        finite_raw = t_raw[np.isfinite(t_raw)]
+        span_raw = 0.0
+        max_abs_raw = 0.0
+        median_dt: Optional[float] = None
+        if finite_raw.size:
+            finite_sorted = np.sort(finite_raw)
+            diffs_raw = np.diff(finite_sorted)
+            diffs_raw = diffs_raw[np.isfinite(diffs_raw)]
+            if diffs_raw.size:
+                median_candidate = float(np.nanmedian(np.abs(diffs_raw)))
+                if np.isfinite(median_candidate) and median_candidate > 0:
+                    median_dt = median_candidate
+            span_raw = float(finite_sorted[-1] - finite_sorted[0]) if finite_sorted.size > 1 else 0.0
+            max_abs_raw = float(np.nanmax(np.abs(finite_raw)))
+
+        def _infer_scale(dt: Optional[float], span: float, max_abs: float) -> float:
+            if dt is not None:
+                if dt >= 5e4:
+                    return 1e9  # ns
+                if dt >= 5e1:
+                    return 1e6  # µs
+                if dt >= 5e-1:
+                    return 1e3  # ms
+                return 1.0
+            if span > 0 or max_abs > 0:
+                if span >= 5e11 or max_abs >= 5e11:
+                    return 1e9
+                if span >= 5e8 or max_abs >= 5e8:
+                    return 1e6
+                if span >= 5e5 or max_abs >= 5e5:
+                    return 1e3
+            return 1.0
+
+        scale_to_seconds = _infer_scale(median_dt, span_raw, max_abs_raw)
+
+        if scale_to_seconds != 1.0:
+            t = t_raw / scale_to_seconds
+        else:
+            t = t_raw
+
+        finite_t = t[np.isfinite(t)]
+        if finite_t.size:
+            t0 = float(np.min(finite_t))
+            t = t - t0
+        else:
+            t = np.arange(len(t_raw), dtype=float) / 10000.0
+
+        diffs = np.diff(t[np.isfinite(t)])
+        dt = float(np.nanmean(diffs)) if diffs.size else 0.0
+        if not (np.isfinite(dt) and dt > 0):
+            dt = 1.0 / 10000.0
+        t_uniform = np.arange(0, dt * len(t), dt, dtype=float)[: len(t)]
+
+        # Detección de columnas X/Y/Z
+        def _is_x(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|x|ch1)", name.lower()))
+
+        def _is_y(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|y|ch2)", name.lower()))
+
+        def _is_z(name: str) -> bool:
+            return bool(re.search(r"(acc|acel|z|ch3)", name.lower()))
+
+        numeric_cols = [
+            col
+            for col in data_frame.columns
+            if col != time_col and pd.api.types.is_numeric_dtype(data_frame[col])
+        ]
+        col_order = {col: idx for idx, col in enumerate(numeric_cols)}
+
+        def _axis_score(col_name: Any, axis_letter: Optional[str]) -> float:
+            name = str(col_name)
+            lower = name.lower()
+            score = 0.0
+            if axis_letter:
+                if axis_letter in lower:
+                    score += 10.0
+                else:
+                    other_letters = {"x", "y", "z"} - {axis_letter}
+                    if any(letter in lower for letter in other_letters):
+                        score -= 4.0
+                if axis_letter == "x" and any(token in lower for token in ["ch1", "canal1", "canal 1"]):
+                    score += 4.0
+                if axis_letter == "y" and any(token in lower for token in ["ch2", "canal2", "canal 2"]):
+                    score += 4.0
+                if axis_letter == "z" and any(token in lower for token in ["ch3", "canal3", "canal 3"]):
+                    score += 4.0
+            if re.search(r"(acc|acel)", lower):
+                score += 6.0
+            if re.search(r"m[/ _]?s\^?2", lower) or "ms2" in lower:
+                score += 8.0
+            if "_m_s2" in lower or "_ms2" in lower:
+                score += 2.0
+            if any(token in lower for token in ["vel", "velocity", "rpm"]):
+                score -= 6.0
+            if any(token in lower for token in ["disp", "despl", "position"]):
+                score -= 6.0
+            if any(token in lower for token in ["count", "adc", "raw"]):
+                score -= 2.0
+            score -= 0.001 * float(col_order.get(col_name, 0))
+            return score
+
+        remaining_cols: List[Any] = list(numeric_cols)
+
+        def _select_axis(axis_letter: Optional[str]) -> Optional[Any]:
+            if not remaining_cols:
+                return None
+            best_col = None
+            best_score = float("-inf")
+            for candidate in remaining_cols:
+                score = _axis_score(candidate, axis_letter)
+                if score > best_score:
+                    best_score = score
+                    best_col = candidate
+            if best_col is not None:
+                remaining_cols.remove(best_col)
+            return best_col
+
+        col_x = _select_axis("x")
+        col_y = _select_axis("y")
+        col_z = _select_axis("z")
+
+        if col_x is None:
+            col_x = _select_axis(None)
+        if col_y is None:
+            col_y = _select_axis(None)
+        if col_z is None:
+            col_z = _select_axis(None)
+
+        def _interp_to_uniform(values: pd.Series) -> np.ndarray:
+            y = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+            finite_mask = np.isfinite(t) & np.isfinite(y)
+            if np.count_nonzero(finite_mask) < 2:
+                return np.zeros_like(t_uniform)
+            base_t = t[finite_mask]
+            base_y = y[finite_mask]
+            order = np.argsort(base_t)
+            base_t = base_t[order]
+            base_y = base_y[order]
+            unique_t, unique_idx = np.unique(base_t, return_index=True)
+            base_y = base_y[unique_idx]
+            unique_t = unique_t.astype(float)
+            return np.interp(t_uniform, unique_t, base_y, left=base_y[0], right=base_y[-1])
+
+        def _get_calibration(name: Optional[str]) -> Optional[Dict[str, float]]:
+            if not calibrations:
+                return None
+            if name is None:
+                return calibrations.get("__default__")
+            name_str = str(name)
+            return (
+                calibrations.get(name_str)
+                or calibrations.get(name_str.lower())
+                or calibrations.get("__default__")
+            )
+
+        def _to_ms2(series: Optional[pd.Series], header_name: Optional[str]) -> Optional[np.ndarray]:
+            if series is None:
+                return None
+
+            series_dtype = getattr(series, "dtype", None)
+            dtype_is_int = pd.api.types.is_integer_dtype(series_dtype)
+            raw_values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+            y = _interp_to_uniform(series)
+            h = str(header_name or "").lower()
+            calib = _get_calibration(header_name)
+
+            def deriv(sig: np.ndarray) -> np.ndarray:
+                if dt <= 0:
+                    return np.zeros_like(sig)
+                return np.gradient(sig, dt, edge_order=2 if sig.size > 2 else 1)
+
+            def second_deriv(sig: np.ndarray) -> np.ndarray:
+                if dt <= 0:
+                    return np.zeros_like(sig)
+                first = deriv(sig)
+                return deriv(first)
+
+            def convert_counts(sig: np.ndarray) -> np.ndarray:
+                if calib:
+                    if "counts_per_g" in calib:
+                        g_val = sig / float(calib["counts_per_g"])
+                        return g_val * 9.80665
+                    if "g_per_count" in calib:
+                        g_val = sig * float(calib["g_per_count"])
+                        return g_val * 9.80665
+                    if "full_scale_g" in calib and "full_scale_counts" in calib:
+                        ratio = float(calib["full_scale_g"]) / float(calib["full_scale_counts"])
+                        g_val = sig * ratio
+                        return g_val * 9.80665
+                    if "mv_per_g" in calib:
+                        # Conteos calibrados mediante sensibilidad en mV/g
+                        mv = sig * 1000.0 if "v" in h and "mv" not in h else sig
+                        g_val = mv / float(calib["mv_per_g"])
+                        return g_val * 9.80665
+                # Heurística estándar: ±2 g en 16 bits
+                return sig * (2.0 / 32768.0) * 9.80665
+
+            finite_raw = raw_values[np.isfinite(raw_values)]
+            counts_like = False
+            if finite_raw.size:
+                max_abs_raw = float(np.nanmax(np.abs(finite_raw)))
+                frac = np.abs(finite_raw - np.round(finite_raw))
+                max_frac = float(np.nanmax(frac)) if frac.size else 0.0
+                has_counts_calib = bool(
+                    calib
+                    and (
+                        "counts_per_g" in calib
+                        or "g_per_count" in calib
+                        or "full_scale_g" in calib
+                        or "full_scale_counts" in calib
+                    )
+                )
+                if (
+                    max_abs_raw > 50.0
+                    and max_abs_raw <= 40000.0
+                    and max_frac < 1e-6
+                    and (dtype_is_int or max_abs_raw >= 512.0 or has_counts_calib)
+                ):
+                    counts_like = True
+
+            if re.search(r"m[/ _]?s\^?2", h):
+                return y
+
+            if any(key in h for key in ["acc", "acel"]):
+                if any(key in h for key in ["mm/s2", "mmps2", "mm s^2", "mm_s2"]):
+                    return y / 1000.0
+                if "mg" in h:
+                    return y * 9.80665e-3
+                if "gal" in h or "cm/s2" in h:
+                    return y * 0.01
+                if re.search(r"[^m]g\b", h) or h.endswith("_g") or " acc_g" in h:
+                    return y * 9.80665
+                if any(key in h for key in ["count", "adc", "volt", "mv", " v"]):
+                    if calib:
+                        if "mv_per_g" in calib:
+                            y_mv = y * 1000.0 if "v" in h and "mv" not in h else y
+                            g_val = y_mv / float(calib["mv_per_g"])
+                            return g_val * 9.80665
+                        if "counts_per_g" in calib or "g_per_count" in calib or "full_scale_g" in calib:
+                            return convert_counts(y)
+                    return y
+                if counts_like:
+                    return convert_counts(y)
+                if calib and ("counts_per_g" in calib or "g_per_count" in calib or "full_scale_g" in calib):
+                    return convert_counts(y)
+                return y
+
+            if counts_like:
+                return convert_counts(y)
+
+            if any(key in h for key in ["vel", "velocity"]):
+                vel = y
+                if any(key in h for key in ["mm/s", "mmps"]) and not any(key in h for key in ["m/s2", "mm/s2"]):
+                    vel = vel / 1000.0
+                return deriv(vel)
+
+            if any(key in h for key in ["disp", "despl", "displacement"]):
+                disp = y
+                if "µm" in h or "um" in h:
+                    disp = disp * 1e-6
+                elif re.search(r"\bmm\b", h) and not any(key in h for key in ["mm/s", "mm/s2"]):
+                    disp = disp * 1e-3
+                return second_deriv(disp)
+
+            if counts_like:
+                return convert_counts(y)
+            return y
+
+        acc_x = _to_ms2(data_frame[col_x], col_x) if col_x is not None else None
+        acc_y = _to_ms2(data_frame[col_y], col_y) if col_y is not None else None
+        acc_z = _to_ms2(data_frame[col_z], col_z) if col_z is not None else None
+
+        data: Dict[str, np.ndarray] = {"t_s": t_uniform.astype(float)}
+        if acc_x is not None:
+            data["accX_ms2"] = np.asarray(acc_x, dtype=float)
+        if acc_y is not None:
+            data["accY_ms2"] = np.asarray(acc_y, dtype=float)
+        if acc_z is not None:
+            data["accZ_ms2"] = np.asarray(acc_z, dtype=float)
+
+        if len(data) <= 1:
+            return None
+
+        return pd.DataFrame(data)
+
+
+    def _reset_analysis_state_on_new_file(self):
+        """Limpia resultados y caches para evitar arrastre entre archivos."""
+
+        # Reset de datos numéricos y caches espectrales
+        self.current_df = None
+        self.signal_unit_map = {}
+        self._last_axis_severity = []
+        self._last_primary_severity = None
+        self._last_xf = None
+        self._last_spec = None
+        self._last_tseg = None
+        self._last_accseg = None
+        self._fft_zoom_range = None
+        self._fft_full_range = None
+        self._fft_zoom_syncing = False
+        self._fft_display_scale = 1.0
+        self._fft_display_unit = "Hz"
+
+        # Restablecer combinaciones vectoriales
+        try:
+            self.combine_signals_enabled = False
+            if hasattr(self, "combine_signals_cb") and self.combine_signals_cb is not None:
+                self.combine_signals_cb.value = False
+                if getattr(self.combine_signals_cb, "page", None):
+                    self.combine_signals_cb.update()
+        except Exception:
+            pass
+        try:
+            for cb in getattr(self, "signal_checkboxes", []) or []:
+                cb.value = False
+                if getattr(cb, "page", None):
+                    cb.update()
+        except Exception:
+            pass
+
+        # Limpiar contenedores visuales principales
+        try:
+            if hasattr(self, "chart_container") and self.chart_container is not None:
+                self.chart_container.content = ft.Column(
+                    [
+                        ft.Icon(ft.Icons.INSIGHTS, color=self._accent_ui()),
+                        ft.Text("Carga un archivo para generar nuevas gráficas", size=14),
+                    ],
+                    horizontal_alignment="center",
+                    alignment="center",
+                    spacing=8,
+                )
+                if getattr(self.chart_container, "page", None):
+                    self.chart_container.update()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "multi_chart_container") and self.multi_chart_container is not None:
+                self.multi_chart_container.content = ft.Text(
+                    "Selecciona canales para visualizar después de cargar un archivo."
+                )
+                if getattr(self.multi_chart_container, "page", None):
+                    self.multi_chart_container.update()
+        except Exception:
+            pass
+
+
     def _load_file_data(self, file_path):
 
         try:
 
+            self._reset_analysis_state_on_new_file()
+
+            calibrations = self._gather_calibration_settings()
+
+            normalized = False
+
             if file_path.endswith('.csv'):
 
-                df = pd.read_csv(file_path)
+                df_raw = pd.read_csv(file_path)
 
             elif file_path.endswith('.xlsx'):
 
-                df = pd.read_excel(file_path)
+                df_raw = pd.read_excel(file_path)
 
             else:
 
-                df = pd.read_csv(file_path)
+                df_raw = pd.read_csv(file_path)
 
+            df = df_raw
 
+            try:
+                df_std = self._standardize_dataset(file_path, df=df_raw, calibrations=calibrations)
+            except Exception as std_err:
+                self._log(f"No se pudo normalizar automáticamente {os.path.basename(file_path)}: {std_err}")
+                df_std = None
 
-            # Detectar columnas numéricas
-
-            numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-
-            if not numeric_cols:
-
-                self._log(f"Archivo inválido: {file_path} no tiene columnas numéricas")
-
-                self.page.snack_bar = ft.SnackBar(
-
-                    content=ft.Text("⚠️ El archivo no contiene columnas numéricas para análisis"),
-
-                    bgcolor="#e74c3c",
-
-                )
-
-                self.page.snack_bar.open = True
-
-                self.page.update()
-
-                return
-
-
-
-            # Columna de tiempo y señales
-
-            time_candidates = [c for c in numeric_cols if "t" in c.lower()]
-
-            self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
-
-            self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
-
-
-
-            self.file_data_storage[file_path] = df
-
-            self.current_df = df
-
-            self._log(f"Datos cargados: {file_path} ({len(df)} filas, {len(df.columns)} columnas)")
-
-
-
-            # Cambiar automáticamente a vista de análisis
-
-            self._select_menu("analysis", force_rebuild=True)
-
-
+            if df_std is not None and not df_std.empty:
+                df = df_std
+                self.signal_unit_map = {col: "acc_ms2" for col in df.columns if col != "t_s"}
+                normalized = True
+            else:
+                self.signal_unit_map = {}
 
         except Exception as e:
 
-            self._log(f"Error al cargar archivo {file_path}: {str(e)}")
+            try:
+                self._log(f"Error al leer archivo {file_path}: {str(e)}")
+            except Exception:
+                pass
 
             self.page.snack_bar = ft.SnackBar(
 
@@ -7671,6 +9294,78 @@ class MainApp:
             self.page.snack_bar.open = True
 
             self.page.update()
+
+            return
+
+
+        # Detectar columnas numéricas
+
+        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+        if not numeric_cols:
+
+            self._log(f"Archivo inválido: {file_path} no tiene columnas numéricas")
+
+            self.page.snack_bar = ft.SnackBar(
+
+                content=ft.Text("⚠️ El archivo no contiene columnas numéricas para análisis"),
+
+                bgcolor="#e74c3c",
+
+            )
+
+            self.page.snack_bar.open = True
+
+            self.page.update()
+
+            return
+
+
+
+        # Columna de tiempo y señales
+
+        time_candidates = [c for c in numeric_cols if "t" in str(c).lower()]
+
+        self.default_time_col = time_candidates[0] if time_candidates else numeric_cols[0]
+
+        self.default_signal_cols = [c for c in numeric_cols if c != self.default_time_col]
+
+
+
+        self.file_data_storage[file_path] = df
+
+        self.current_df = df
+        self._last_axis_severity = []
+        self._last_primary_severity = None
+        self._fft_full_range = None
+        self._fft_zoom_range = None
+
+        try:
+            self.input_signal_unit = "acc_ms2"
+            if getattr(self, "input_signal_unit_dd", None):
+                self.input_signal_unit_dd.value = "acc_ms2"
+                self.input_signal_unit_dd.update()
+        except Exception:
+            pass
+
+        status_msg = "Datos cargados y normalizados" if normalized else "Datos cargados"
+        self._log(f"{status_msg}: {file_path} ({len(df)} filas, {len(df.columns)} columnas)")
+
+
+
+        # Cambiar automáticamente a vista de análisis
+
+        self._select_menu("analysis", force_rebuild=True)
+
+        try:
+            if getattr(self, "runup_start_field", None):
+                self.runup_start_field.value = ""
+                self.runup_start_field.update()
+            if getattr(self, "runup_end_field", None):
+                self.runup_end_field.value = ""
+                self.runup_end_field.update()
+        except Exception:
+            pass
 
 
 
@@ -7811,6 +9506,19 @@ class MainApp:
                 ctrl.update()
         self._update_analysis()
 
+    def _on_input_signal_unit_change(self, e=None):
+        unit = getattr(getattr(e, "control", None), "value", None) if e else None
+        self.input_signal_unit = unit if unit else getattr(self, "input_signal_unit", "acc_ms2")
+        try:
+            self.page.client_storage.set("input_signal_unit", self.input_signal_unit)
+        except Exception:
+            pass
+        self._update_analysis()
+        try:
+            self._update_multi_chart()
+        except Exception:
+            pass
+
     def _on_fft_color_change(self, e=None):
 
         selected = getattr(getattr(e, "control", None), "value", None) if e else None
@@ -7821,6 +9529,21 @@ class MainApp:
             ctrl.value = self.fft_plot_color
             if ctrl.page:
                 ctrl.update()
+        self._update_analysis()
+
+
+    def _on_fft_window_change(self, e=None):
+
+        try:
+            selected = getattr(getattr(e, "control", None), "value", None) if e else None
+        except Exception:
+            selected = None
+        resolved = _resolve_fft_window(selected if selected is not None else getattr(self, "fft_window_type", "hann"))
+        self.fft_window_type = resolved
+        try:
+            self.page.client_storage.set("fft_window_type", resolved)
+        except Exception:
+            pass
         self._update_analysis()
 
 
@@ -7965,34 +9688,39 @@ class MainApp:
                 except Exception:
                     fmax_ui = None
 
+                freq_scale = getattr(self, "_fft_display_scale", 1.0) or 1.0
+                if not np.isfinite(freq_scale) or freq_scale <= 0:
+                    freq_scale = 1.0
+                freq_unit = getattr(self, "_fft_display_unit", "Hz") or "Hz"
+
                 for sig in selected_signals:
 
-                    y = self.current_df[sig].to_numpy()
-
-                    N = len(y)
-
-                    if N < 2:
-
+                    y_raw = self.current_df[sig].to_numpy()
+                    t_sig, acc_sig, _, _ = self._prepare_segment_for_analysis(t, y_raw, sig)
+                    if acc_sig.size < 2 or t_sig.size != acc_sig.size:
                         continue
+                    try:
+                        pre_dec = float(fmax_ui) if fmax_ui and fmax_ui > 0 else None
+                    except Exception:
+                        pre_dec = None
+                    res_sig = analyze_vibration(
+                        t_sig,
+                        acc_sig,
+                        pre_decimate_to_fmax_hz=pre_dec,
+                        fft_window=self.fft_window_type,
+                    )
+                    xf = res_sig.get('fft', {}).get('f_hz')
+                    mag_vel_mm = res_sig.get('fft', {}).get('vel_spec_mm_s')
+                    mag_acc = res_sig.get('fft', {}).get('acc_spec_ms2')
+                    if xf is None or mag_vel_mm is None:
+                        continue
+                    xf = np.asarray(xf, dtype=float)
+                    mag_vel_mm = np.asarray(mag_vel_mm, dtype=float)
+                    mag_acc = np.asarray(mag_acc if mag_acc is not None else np.zeros_like(mag_vel_mm), dtype=float)
 
-                    T = t[1] - t[0]
-
-                    yf = np.fft.fft(y)
-
-                    xf = np.fft.fftfreq(N, T)[:N // 2]
-
-                    mag_acc = 2.0 / N * np.abs(yf[0:N // 2])
-
-                    mag_vel_mm = np.zeros_like(mag_acc)
-
-                    mag_vel_mm[xf > 0] = (mag_acc[xf > 0] / (2 * np.pi * xf[xf > 0])) * 1000
-
-
-
-                    # Aplicar máscara de frecuencia
                     mask = xf >= max(0.0, fmin_ui)
                     if fmax_ui and fmax_ui > 0:
-                        mask = mask & (xf <= fmax_ui)
+                        mask = mask & (xf <= float(fmax_ui))
 
                     if use_dbv:
                         if sens_unit == 'mV/g':
@@ -8005,20 +9733,19 @@ class MainApp:
                         elif sens_unit == 'V/(mm/s)':
                             V_amp = mag_vel_mm * sens_val * gain_vv
                         else:
-                            V_amp = mag_vel_mm * 0.0
+                            V_amp = np.zeros_like(mag_vel_mm)
                         eps = 1e-12
                         yplot = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
-                        ax.plot(xf[mask], yplot[mask], linewidth=2, label=sig)
+                        ax.plot((xf[mask] / freq_scale), yplot[mask], linewidth=2, label=sig)
                     else:
-                        if normalize and mag_vel_mm.max() > 0:
-                            mag_vel_mm = mag_vel_mm / mag_vel_mm.max()
-                        ax.plot(xf[mask], mag_vel_mm[mask], linewidth=2, label=sig)
-
-
+                        yplot = mag_vel_mm.copy()
+                        if normalize and yplot.max() > 0:
+                            yplot = yplot / yplot.max()
+                        ax.plot((xf[mask] / freq_scale), yplot[mask], linewidth=2, label=sig)
 
                 ax.set_title("FFT combinada de señales")
 
-                ax.set_xlabel("Frecuencia (Hz)")
+                ax.set_xlabel(f"Frecuencia ({freq_unit})")
 
                 if use_dbv:
                     ax.set_ylabel("Nivel [dBV]")
@@ -8039,7 +9766,7 @@ class MainApp:
 
                 try:
                     if fmax_ui and fmax_ui > 0:
-                        ax.set_xlim(left=0.0, right=float(fmax_ui))
+                        ax.set_xlim(left=0.0, right=float(fmax_ui) / freq_scale)
                     if fmin_ui and fmin_ui > 0:
                         cur = ax.get_xlim()
                         ax.set_xlim(left=float(fmin_ui), right=cur[1])
